@@ -26,7 +26,7 @@ see LICENSE file.
 #include <fstream>
 
 #ifdef TORRENT_UTP_LOG_ENABLE
-#include "libtorrent/utp_stream.hpp"
+#include "libtorrent/aux_/utp_stream.hpp"
 #endif
 
 using namespace lt;
@@ -36,7 +36,7 @@ namespace {
 void test_transfer()
 {
 #ifdef TORRENT_UTP_LOG_ENABLE
-	lt::set_utp_stream_logging(true);
+	lt::aux::set_utp_stream_logging(true);
 #endif
 
 	// in case the previous run was terminated
