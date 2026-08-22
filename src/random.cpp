@@ -14,6 +14,11 @@ see LICENSE file.
 #include "libtorrent/error_code.hpp"
 #include "libtorrent/aux_/throw.hpp"
 
+#include <random>
+#include <algorithm>
+#include <cstdint>
+#include <cerrno>
+
 #if defined BOOST_NO_CXX11_THREAD_LOCAL
 #include <mutex>
 #endif
@@ -23,7 +28,13 @@ see LICENSE file.
 #include <atomic>
 #endif
 
-#if TORRENT_USE_CNG
+#if TORRENT_USE_GETRANDOM
+
+#include <sys/random.h>
+// this is the fall-back in case getrandom() fails
+#include "libtorrent/aux_/dev_random.hpp"
+
+#elif TORRENT_USE_CNG
 #include "libtorrent/aux_/win_cng.hpp"
 
 #elif TORRENT_USE_CRYPTOAPI
@@ -32,17 +43,12 @@ see LICENSE file.
 #elif defined TORRENT_USE_LIBCRYPTO && !defined TORRENT_USE_WOLFSSL
 
 #include "libtorrent/aux_/disable_warnings_push.hpp"
-extern "C" {
+extern "C"
+{
 #include <openssl/rand.h>
 #include <openssl/err.h>
 }
 #include "libtorrent/aux_/disable_warnings_pop.hpp"
-
-#elif TORRENT_USE_GETRANDOM
-
-#include <sys/random.h>
-// this is the fall-back in case getrandom() fails
-#include "libtorrent/aux_/dev_random.hpp"
 
 #elif TORRENT_USE_DEV_RANDOM
 #include "libtorrent/aux_/dev_random.hpp"
@@ -50,124 +56,155 @@ extern "C" {
 
 #ifdef BOOST_NO_CXX11_THREAD_LOCAL
 namespace {
-	// if the random number generator can't be thread local, just protect it with
-	// a mutex. Not ideal, but hopefully not too many people are affected by old
-	// systems
-	std::mutex rng_mutex;
+// if the random number generator can't be thread local, just protect it with
+// a mutex. Not ideal, but hopefully not too many people are affected by old
+// systems
+std::mutex rng_mutex;
 }
 #endif
 
 namespace libtorrent::aux {
 
-		std::mt19937& random_engine()
-		{
+std::mt19937& random_engine()
+{
 #ifdef TORRENT_BUILD_SIMULATOR
-			// make sure random numbers are deterministic. Seed with a fixed number
-			static std::mt19937 rng(0x82daf973);
+	// make sure random numbers are deterministic. Seed with a fixed number
+	static std::mt19937 rng(0x82daf973);
 #else
 
 #if TORRENT_BROKEN_RANDOM_DEVICE
-			struct {
-				std::uint32_t operator()() const
-				{
-					std::uint32_t ret;
-					crypto_random_bytes({reinterpret_cast<char*>(&ret), sizeof(ret)});
-					return ret;
-				}
-			} dev;
+	struct
+	{
+		std::uint32_t operator()() const
+		{
+			std::uint32_t ret;
+			crypto_random_bytes({reinterpret_cast<char*>(&ret), sizeof(ret)});
+			return ret;
+		}
+	} dev;
 #else
-			static std::random_device dev;
+	// Instantiate locally to avoid data races across multiple threads during initialization
+	std::random_device dev;
 #endif
 #ifdef BOOST_NO_CXX11_THREAD_LOCAL
-			static std::seed_seq seed({dev(), dev(), dev(), dev()});
-			static std::mt19937 rng(seed);
+	static std::seed_seq seed({dev(), dev(), dev(), dev()});
+	static std::mt19937 rng(seed);
 #else
-			thread_local static std::seed_seq seed({dev(), dev(), dev(), dev()});
-			thread_local static std::mt19937 rng(seed);
+	thread_local static std::seed_seq seed({dev(), dev(), dev(), dev()});
+	thread_local static std::mt19937 rng(seed);
 #endif
 #endif
-			return rng;
-		}
+	return rng;
+}
 
-		void random_bytes(span<char> buffer)
-		{
+void random_bytes(span<char> buffer)
+{
 #ifdef TORRENT_BUILD_SIMULATOR
-			// simulator
-			for (auto& b : buffer) b = char(random(0xff));
+	// simulator
+	for (auto& b : buffer)
+		b = static_cast<char>(static_cast<unsigned char>(random(0xff)));
 #else
-			std::generate(buffer.begin(), buffer.end(), [] { return char(random(0xff)); });
+	std::generate(buffer.begin(), buffer.end(), [] {
+		return static_cast<char>(static_cast<unsigned char>(random(0xff)));
+	});
 #endif
-		}
+}
 
-		void crypto_random_bytes(span<char> buffer)
-		{
+void crypto_random_bytes(span<char> buffer)
+{
 #ifdef TORRENT_BUILD_SIMULATOR
-			// In the simulator we want deterministic random numbers
-			std::generate(buffer.begin(), buffer.end(), [] { return char(random(0xff)); });
-#elif TORRENT_USE_CNG
-			aux::cng_gen_random(buffer);
-#elif TORRENT_USE_CRYPTOAPI
-			// windows
-			aux::crypt_gen_random(buffer);
-#elif defined TORRENT_USE_LIBCRYPTO && !defined TORRENT_USE_WOLFSSL
-// wolfSSL uses wc_RNG_GenerateBlock as the internal function for the
-// openssl compatibility layer. This function API does not support
-// an arbitrary buffer size (openssl does), it is limited by the
-// constant RNG_MAX_BLOCK_LEN.
-// TODO: improve calling RAND_bytes multiple times, using fallback for now
-
-			// openssl
-			int r = RAND_bytes(reinterpret_cast<unsigned char*>(buffer.data())
-				, int(buffer.size()));
-			if (r != 1) aux::throw_ex<system_error>(errors::no_entropy);
+	// In the simulator we want deterministic random numbers
+	std::generate(buffer.begin(), buffer.end(), [] {
+		return static_cast<char>(static_cast<unsigned char>(random(0xff)));
+	});
 #elif TORRENT_USE_GETRANDOM
-			ssize_t const r = ::getrandom(buffer.data(), static_cast<std::size_t>(buffer.size()), 0);
-			if (r == ssize_t(buffer.size())) return;
-			if (r == -1 && errno != ENOSYS) aux::throw_ex<system_error>(error_code(errno, generic_category()));
-			static dev_random dev;
-			dev.read(buffer);
+	char* ptr = buffer.data();
+	std::size_t remaining = static_cast<std::size_t>(buffer.size());
+
+	while (remaining > 0)
+	{
+		ssize_t const r = ::getrandom(ptr, remaining, 0);
+		if (r > 0)
+		{
+			ptr += r;
+			remaining -= static_cast<std::size_t>(r);
+		}
+		else if (r == -1)
+		{
+			if (errno == EINTR)
+				continue;
+			if (errno == ENOSYS)
+			{
+				// Fall back to /dev/urandom if getrandom() system call is unavailable
+				dev_random dev;
+				dev.read(span<char>(ptr, remaining));
+				return;
+			}
+			aux::throw_ex<system_error>(error_code(errno, generic_category()));
+		}
+	}
+#elif TORRENT_USE_CNG
+	aux::cng_gen_random(buffer);
+#elif TORRENT_USE_CRYPTOAPI
+	// windows
+	aux::crypt_gen_random(buffer);
+#elif defined TORRENT_USE_LIBCRYPTO && !defined TORRENT_USE_WOLFSSL
+	// wolfSSL uses wc_RNG_GenerateBlock as the internal function for the
+	// openssl compatibility layer. This function API does not support
+	// an arbitrary buffer size (openssl does), it is limited by the
+	// constant RNG_MAX_BLOCK_LEN.
+	// TODO: improve calling RAND_bytes multiple times, using fallback for now
+
+	// openssl
+	int r = RAND_bytes(reinterpret_cast<unsigned char*>(buffer.data()), int(buffer.size()));
+	if (r != 1)
+		aux::throw_ex<system_error>(errors::no_entropy);
 #elif TORRENT_USE_DEV_RANDOM
-			static dev_random dev;
-			dev.read(buffer);
+	dev_random dev;
+	dev.read(buffer);
 #else
 
 #if TORRENT_BROKEN_RANDOM_DEVICE
-			// even pseudo random numbers rely on being able to seed the random
-			// generator
+	// even pseudo random numbers rely on being able to seed the random
+	// generator
 #error "no entropy source available"
 #else
 #ifdef TORRENT_I_WANT_INSECURE_RANDOM_NUMBERS
-			std::generate(buffer.begin(), buffer.end(), [] { return char(random(0xff)); });
+	std::generate(buffer.begin(), buffer.end(), [] {
+		return static_cast<char>(static_cast<unsigned char>(random(0xff)));
+	});
 #else
-#error "no secure entropy source available. If you really want insecure random numbers, define TORRENT_I_WANT_INSECURE_RANDOM_NUMBERS"
+#error \
+	"no secure entropy source available. If you really want insecure random numbers, define TORRENT_I_WANT_INSECURE_RANDOM_NUMBERS"
 #endif
 #endif
 
 #endif
-		}
+}
 
-	std::uint32_t random(std::uint32_t const max)
-	{
-		if (max == 0) return 0;
+std::uint32_t random(std::uint32_t const max)
+{
+	if (max == 0)
+		return 0;
 #ifdef BOOST_NO_CXX11_THREAD_LOCAL
-		std::lock_guard<std::mutex> l(rng_mutex);
+	std::lock_guard<std::mutex> l(rng_mutex);
 #endif
 #ifdef TORRENT_BUILD_SIMULATOR
-		std::uint32_t mask = max | (max >> 16);
-		mask |= mask >> 8;
-		mask |= mask >> 4;
-		mask |= mask >> 2;
-		mask |= mask >> 1;
-		auto& rng = aux::random_engine();
-		std::uint32_t ret;
-		do
-		{
-			ret = rng() & mask;
-		} while (ret > max);
-#else
-		auto const ret = std::uniform_int_distribution<std::uint32_t>(0, max)(aux::random_engine());
-#endif
-		return ret;
+	std::uint32_t mask = max | (max >> 16);
+	mask |= mask >> 8;
+	mask |= mask >> 4;
+	mask |= mask >> 2;
+	mask |= mask >> 1;
+	auto& rng = aux::random_engine();
+	std::uint32_t ret;
+	do
+	{
+		ret = rng() & mask;
 	}
-
+	while (ret > max);
+#else
+	auto const ret = std::uniform_int_distribution<std::uint32_t>(0, max)(aux::random_engine());
+#endif
+	return ret;
+}
 }
