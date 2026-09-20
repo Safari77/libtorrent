@@ -24,6 +24,7 @@ see LICENSE file.
 #include <cstdlib>
 #include <charconv>
 #include <stdexcept>
+#include <filesystem>
 
 #include "libtorrent/session.hpp"
 #include "libtorrent/hasher.hpp"
@@ -57,6 +58,7 @@ see LICENSE file.
 
 using namespace lt;
 using namespace std::chrono_literals;
+namespace filesystem = std::filesystem;
 
 #if defined TORRENT_WINDOWS
 #include <conio.h>
@@ -1287,8 +1289,8 @@ std::tuple<torrent_handle, torrent_handle, torrent_handle> setup_transfer(lt::se
 			param.flags = atp->flags;
 		}
 		file.close();
-		remove_all(combine_path("tmp2" + suffix, "temporary"), ec);
-		remove_all(combine_path("tmp3" + suffix, "temporary"), ec);
+		filesystem::remove_all(combine_path("tmp2" + suffix, "temporary"));
+		filesystem::remove_all(combine_path("tmp3" + suffix, "temporary"));
 		std::printf("generated torrent: %s %s\n", aux::to_hex(param.ti->info_hashes().v2).c_str(), file_path.c_str());
 	}
 	else

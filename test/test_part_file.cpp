@@ -8,11 +8,13 @@ You may use, distribute and modify this code under the terms of the BSD license,
 see LICENSE file.
 */
 
+#include <filesystem>
 #include <cstring>
 #include <array>
 
 #include "test.hpp"
 #include "test_utils.hpp"
+#include "setup_transfer.hpp"
 #include "libtorrent/aux_/part_file.hpp"
 #include "libtorrent/aux_/posix_part_file.hpp"
 #include "libtorrent/aux_/path.hpp"
@@ -21,6 +23,7 @@ see LICENSE file.
 #include "libtorrent/truncate.hpp"
 
 using namespace lt;
+namespace filesystem = std::filesystem;
 
 namespace {
 
@@ -54,9 +57,7 @@ namespace {
 		int const piece_size = 16 * 0x4000;
 		int const num_pieces = 100;
 
-		remove_all(path, ec);
-		if (ec == boost::system::errc::no_such_file_or_directory) ec.clear();
-		TEST_CHECK(!ec);
+		filesystem::remove_all(path);
 		create_directory(path, ec);
 		TEST_CHECK(!ec);
 
@@ -91,8 +92,7 @@ namespace {
 		TEST_EQUAL(ec, errors::file_too_short);
 		TEST_CHECK(!exported);
 
-		remove_all(path, ec);
-		TEST_CHECK(!ec);
+		filesystem::remove_all(path);
 	}
 
 } // anonymous namespace
@@ -102,10 +102,8 @@ TORRENT_TEST(part_file)
 	error_code ec;
 	std::string cwd = absolute(".");
 
-	remove_all(combine_path(cwd, "partfile_test_dir"), ec);
-	if (ec) std::printf("remove_all: %s\n", ec.message().c_str());
-	remove_all(combine_path(cwd, "partfile_test_dir2"), ec);
-	if (ec) std::printf("remove_all: %s\n", ec.message().c_str());
+	filesystem::remove_all(combine_path(cwd, "partfile_test_dir"));
+	filesystem::remove_all(combine_path(cwd, "partfile_test_dir2"));
 
 	int piece_size = 16 * 0x4000;
 	std::array<char, 1024> buf;
@@ -209,10 +207,8 @@ TORRENT_TEST(posix_part_file)
 	error_code ec;
 	std::string cwd = absolute(".");
 
-	remove_all(combine_path(cwd, "partfile_test_dir"), ec);
-	if (ec) std::printf("remove_all: %s\n", ec.message().c_str());
-	remove_all(combine_path(cwd, "partfile_test_dir2"), ec);
-	if (ec) std::printf("remove_all: %s\n", ec.message().c_str());
+	filesystem::remove_all(combine_path(cwd, "partfile_test_dir"));
+	filesystem::remove_all(combine_path(cwd, "partfile_test_dir2"));
 
 	int piece_size = 16 * 0x4000;
 	std::array<char, 1024> buf;

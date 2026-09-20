@@ -11,6 +11,7 @@ You may use, distribute and modify this code under the terms of the BSD license,
 see LICENSE file.
 */
 
+#include <filesystem>
 #include "libtorrent/aux_/file.hpp"
 #include "libtorrent/aux_/directory.hpp"
 #include "libtorrent/aux_/path.hpp"
@@ -23,6 +24,7 @@ see LICENSE file.
 #include "libtorrent/aux_/scope_end.hpp"
 #include "test.hpp"
 #include "test_utils.hpp"
+#include "setup_transfer.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <vector>
@@ -36,6 +38,7 @@ see LICENSE file.
 #endif
 
 using namespace lt;
+namespace filesystem = std::filesystem;
 
 namespace {
 
@@ -192,8 +195,7 @@ TORRENT_TEST(directory)
 	TEST_CHECK(files.count(".") == 1);
 	files.clear();
 
-	remove_all("file_test_dir", ec);
-	if (ec) std::printf("remove_all: %s\n", ec.message().c_str());
+	filesystem::remove_all("file_test_dir");
 }
 
 // test path functions
