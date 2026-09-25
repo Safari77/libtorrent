@@ -446,7 +446,7 @@ namespace {
 		{
 			auto const idx = static_cast<std::size_t>(i);
 			if (f[idx] == '/') break;
-#ifdef TORRENT_WINDOWS
+#if defined(TORRENT_WINDOWS) || defined(TORRENT_OS2)
 			if (f[idx] == '\\') break;
 #endif
 			if (f[idx] != '.') continue;
@@ -458,13 +458,30 @@ namespace {
 	std::string remove_extension(std::string const& f)
 	{
 		char const* slash = std::strrchr(f.c_str(), '/');
-#ifdef TORRENT_WINDOWS
+#if defined(TORRENT_WINDOWS) || defined(TORRENT_OS2)
 		slash = std::max((char const*)std::strrchr(f.c_str(), '\\'), slash);
 #endif
 		char const* ext = std::strrchr(f.c_str(), '.');
 		// if we don't have an extension, just return f
 		if (ext == nullptr || ext == &f[0] || (slash != nullptr && ext < slash)) return f;
 		return f.substr(0, aux::numeric_cast<std::size_t>(ext - &f[0]));
+	}
+
+	// splits "name" into (base, extension) at the last '.', without
+	// allocating. A single leading dot with no other dots yields no
+	// extension; multiple dots split at the last one even if the name
+	// starts with '.', unlike extension(). name must contain no path
+	// separator; see sanitize_path_element().
+	std::pair<string_view, string_view> split_base_ext(string_view const name)
+	{
+		TORRENT_ASSERT(name.find('/') == string_view::npos);
+#if defined(TORRENT_WINDOWS) || defined(TORRENT_OS2)
+		TORRENT_ASSERT(name.find('\\') == string_view::npos);
+#endif
+		std::size_t const dot = name.rfind('.');
+		if (dot == 0 || dot == string_view::npos)
+			return {name, string_view()};
+		return {name.substr(0, dot), name.substr(dot)};
 	}
 
 	bool is_root_path(std::string const& f)
@@ -565,9 +582,9 @@ namespace {
 	{
 		if (f.empty()) return f;
 
-		#ifdef TORRENT_WINDOWS
+#if defined(TORRENT_WINDOWS) || defined(TORRENT_OS2)
 		if (f == "\\\\") return "";
-		#endif
+#endif
 		if (f == "/") return "";
 
 		int len = int(f.size());
@@ -576,11 +593,11 @@ namespace {
 		while (len > 0)
 		{
 			--len;
-			#ifdef TORRENT_WINDOWS
+#if defined(TORRENT_WINDOWS) || defined(TORRENT_OS2)
 			if (f[std::size_t(len)] == '/' || f[std::size_t(len)] == '\\') break;
-			#else
+#else
 			if (f[std::size_t(len)] == '/') break;
-			#endif
+#endif
 		}
 
 		if (f[std::size_t(len)] == '/' || f[std::size_t(len)] == '\\') ++len;

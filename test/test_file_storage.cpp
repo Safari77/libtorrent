@@ -217,7 +217,7 @@ TORRENT_TEST(file_hash_matches_file_path)
 	file_storage st;
 	setup_test_storage(st);
 
-	aux::vector<std::uint32_t, aux::path_index_t> const eh = st.compute_element_hashes();
+	aux::vector<std::uint32_t, path_index_t> const eh = st.compute_element_hashes();
 	for (file_index_t const i : st.file_range())
 	{
 		boost::crc_optimal<32, 0x1EDC6F41, 0xFFFFFFFF, 0xFFFFFFFF, true, true> crc;
@@ -1223,15 +1223,20 @@ TORRENT_TEST(test_renamed_files)
 #else
 	TEST_EQUAL(rf.file_path(fs, 0_file, "/root"), "/root/foobar");
 #endif
+	// an empty save_path resolves the rename relative to nothing, i.e. just
+	// the new (bare) filename
+	TEST_EQUAL(rf.file_path(fs, 0_file), "foobar");
 	TEST_EQUAL(std::string(rf.file_name(fs, 0_file)), "foobar");
 
 	// full path
 #ifdef TORRENT_WINDOWS
 	rf.rename_file(fs, 1_file, "test\\bar");
 	TEST_EQUAL(rf.file_path(fs, 1_file, "d:\\root"), "d:\\root\\test\\bar");
+	TEST_EQUAL(rf.file_path(fs, 1_file), "test\\bar");
 #else
 	rf.rename_file(fs, 1_file, "test/bar");
 	TEST_EQUAL(rf.file_path(fs, 1_file, "/root"), "/root/test/bar");
+	TEST_EQUAL(rf.file_path(fs, 1_file), "test/bar");
 #endif
 	TEST_EQUAL(std::string(rf.file_name(fs, 1_file)), "bar");
 
@@ -1243,6 +1248,8 @@ TORRENT_TEST(test_renamed_files)
 	rf.rename_file(fs, 2_file, "/foobar/foo");
 	TEST_EQUAL(rf.file_path(fs, 2_file, "/root"), "/foobar/foo");
 #endif
+	// an absolute rename ignores save_path entirely, empty or not
+	TEST_EQUAL(rf.file_path(fs, 2_file), rf.file_path(fs, 2_file, "/root"));
 	TEST_EQUAL(std::string(rf.file_name(fs, 2_file)), "foo");
 }
 
