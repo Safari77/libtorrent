@@ -95,14 +95,25 @@ struct test_torrent_t
 
 using namespace lt;
 
-// pins the resolve_duplicate_filenames() whole-tree pass (renamed_files
+// pins the resolve_duplicate_filenames() full-path pass (renamed_files
 // populated, directories exempt from collision-renaming), for tests that
 // lock in that specific algorithm's tie-break rules rather than
 // default_flags' current behavior
-load_torrent_limits whole_tree_dedup_cfg()
+load_torrent_limits full_path_dedup_cfg()
 {
 	load_torrent_limits c;
 	c.sanitize_flags = path_sanitize_flags::libtorrent_2_1;
+	return c;
+}
+
+// default_flags with both deduplication passes turned off, so colliding
+// file paths are left as-is
+load_torrent_limits no_dedup_cfg()
+{
+	load_torrent_limits c;
+	c.sanitize_flags = path_sanitize_flags::default_flags
+		& ~(path_sanitize_flags::deduplicate_full_path
+			| path_sanitize_flags::deduplicate_per_directory);
 	return c;
 }
 
@@ -154,7 +165,21 @@ static test_torrent_t const test_torrents[] = {
 			TEST_CHECK(atp.ti->layout().file_path(file_index_t{0}) == combine_path(combine_path("temp", "foo"), "bar.txt"));
 			TEST_EQUAL(atp.renamed_files.find(file_index_t{1})->second, combine_path(combine_path("temp", "foo"), "bar.1.txt"));
 		},
-		whole_tree_dedup_cfg()},
+		full_path_dedup_cfg()},
+	{"duplicate_files.torrent",
+		[](lt::add_torrent_params const& atp) {
+			// with deduplication disabled, both files keep the same path
+			TEST_EQUAL(atp.ti->num_files(), 2);
+			TEST_CHECK(atp.renamed_files.empty());
+			TEST_CHECK(atp.renamed_path_elements.empty());
+			std::string const path = combine_path(combine_path("temp", "foo"), "bar.txt");
+			TEST_EQUAL(atp.ti->layout().file_path(file_index_t{0}), path);
+			TEST_EQUAL(atp.ti->layout().file_path(file_index_t{1}), path);
+#if TORRENT_ABI_VERSION < 4
+			TEST_EQUAL(atp.ti->files().file_path(file_index_t{1}), path);
+#endif
+		},
+		no_dedup_cfg()},
 	{"pad_file.torrent",
 		[](lt::add_torrent_params atp) {
 			TEST_EQUAL(atp.ti->num_files(), 2);
@@ -314,7 +339,24 @@ static test_torrent_t const test_torrents[] = {
 			TEST_EQUAL(atp.ti->layout().file_path(file_index_t{1}), "test2" SEPARATOR "_" SEPARATOR "foo");
 			TEST_EQUAL(atp.renamed_files[file_index_t{1}], "test2" SEPARATOR "_" SEPARATOR "foo.1");
 		},
-		whole_tree_dedup_cfg()},
+		full_path_dedup_cfg()},
+	{"invalid_directory_name.torrent",
+		[](lt::add_torrent_params const& atp) {
+			// with deduplication disabled, two distinct raw directory names
+			// that sanitize to the same "_" leave both files on one path
+			TEST_EQUAL(atp.ti->num_files(), 2);
+			TEST_CHECK(atp.renamed_files.empty());
+			TEST_CHECK(atp.renamed_path_elements.empty());
+#if TORRENT_ABI_VERSION < 4
+			TEST_EQUAL(
+				atp.ti->files().file_path(file_index_t{1}), "test2" SEPARATOR "_" SEPARATOR "foo");
+#endif
+			TEST_EQUAL(
+				atp.ti->layout().file_path(file_index_t{0}), "test2" SEPARATOR "_" SEPARATOR "foo");
+			TEST_EQUAL(
+				atp.ti->layout().file_path(file_index_t{1}), "test2" SEPARATOR "_" SEPARATOR "foo");
+		},
+		no_dedup_cfg()},
 	{"v2.torrent",
 		[](lt::add_torrent_params atp) {
 			TEST_EQUAL(atp.ti->num_files(), 1);
@@ -378,7 +420,7 @@ static test_torrent_t const test_torrents[] = {
 			TEST_EQUAL(atp.ti->layout().file_path(file_index_t{2}), "test" SEPARATOR "stress_test2"_sv);
 			TEST_EQUAL(atp.renamed_files[file_index_t{1}], "test" SEPARATOR "_.1"_sv);
 		},
-		whole_tree_dedup_cfg()},
+		full_path_dedup_cfg()},
 	{"v2_symlinks.torrent",
 		[](lt::add_torrent_params atp) {
 			TEST_CHECK(atp.ti->num_files() > 3);
@@ -512,13 +554,13 @@ test_failing_torrent_t test_error_torrents[] = {
 	{"v2_zero_root.torrent", errors::torrent_missing_pieces_root},
 	{"v2_zero_root_small.torrent", errors::torrent_missing_pieces_root},
 	{"v2_empty_filename.torrent", errors::torrent_file_parse_failed},
-	// pins the whole-tree resolve_duplicate_filenames_slow() pass: its
+	// pins the full-path resolve_duplicate_filenames_slow() pass: its
 	// restart-from-1 probing across 118 duplicates of the same name
 	// exhausts the default max_duplicate_filenames, unlike
 	// deduplicate_per_directory's counter-resuming algorithm (part of
 	// default_flags), which resolves the same input without ever
 	// approaching that limit
-	{"duplicate_files2.torrent", errors::too_many_duplicate_filenames, whole_tree_dedup_cfg()},
+	{"duplicate_files2.torrent", errors::too_many_duplicate_filenames, full_path_dedup_cfg()},
 };
 
 } // anonymous namespace
@@ -732,562 +774,6 @@ TORRENT_TEST(hybrid_torrent_missing_pieces)
 	add_torrent_params const atp = load_torrent_buffer(buf, ec, load_torrent_limits{});
 	TEST_CHECK(!atp.ti);
 	TEST_EQUAL(ec, error_code(errors::torrent_missing_pieces));
-}
-
-namespace {
-// sanitize_path_element() only writes to "path" when the element
-// actually needed sanitizing; otherwise it returns true and leaves "path"
-// untouched so the caller can borrow "element" directly. This collapses
-// that into a plain returned string for the tests below, and checks the
-// borrow invariant along the way.
-std::string sanitize(string_view const element,
-	bool const force_element = false,
-	lt::path_sanitize_flags_t const sanitize_flags = lt::path_sanitize_flags::default_flags)
-{
-	std::string path;
-	bool const unchanged =
-		lt::aux::sanitize_path_element(path, element, sanitize_flags, force_element);
-	if (unchanged)
-	{
-		TEST_CHECK(path.empty());
-		return std::string(element);
-	}
-	return path;
-}
-} // anonymous namespace
-
-TORRENT_TEST(sanitize_path_truncate)
-{
-	TEST_EQUAL(sanitize("abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-						"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-						"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-						"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-						"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"),
-		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_");
-
-	TEST_EQUAL(sanitize("abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-						"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-						"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-						"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-						"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcde.test"),
-		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_.test");
-}
-
-TORRENT_TEST(sanitize_path_truncate_utf)
-{
-	// msvc doesn't like unicode string literals, so we encode it as UTF-8 explicitly
-	TEST_EQUAL(sanitize("abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-						"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-						"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-						"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-						"abcdefghi_abcdefghi_abcdefghi_abcdefghi"
-						"\xE2"
-						"\x80"
-						"\x94"
-						"abcde.jpg"),
-		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-		"abcdefghi_abcdefghi_abcdefghi_abcdefghi"
-		"\xE2"
-		"\x80"
-		"\x94"
-		".jpg");
-}
-
-TORRENT_TEST(sanitize_path_truncate_unicode_chars)
-{
-	// path_sanitize_flags::limit_unicode_characters selects whether the
-	// 240-limit counts unicode characters (code points) or encoded UTF-8
-	// bytes. Build a multi-byte character run long enough that the two
-	// rules truncate at different points, and exercise both rulesets
-	// explicitly so the test doesn't depend on the platform's default.
-
-	// U+00A9 (copyright sign), 2 bytes per character
-	std::string const two_byte_char = "\xC2\xA9";
-
-	std::string long_element;
-	for (int i = 0; i < 300; ++i)
-		long_element += two_byte_char;
-
-	// counting characters: truncated after 240 characters (480 bytes)
-	std::string expected_by_chars;
-	for (int i = 0; i < 240; ++i)
-		expected_by_chars += two_byte_char;
-	TEST_EQUAL(sanitize(long_element, false, lt::path_sanitize_flags::limit_unicode_characters),
-		expected_by_chars);
-
-	// counting bytes: truncated after 240 bytes (120 characters)
-	std::string expected_by_bytes;
-	for (int i = 0; i < 120; ++i)
-		expected_by_bytes += two_byte_char;
-	TEST_EQUAL(sanitize(long_element, false, lt::path_sanitize_flags_t{}), expected_by_bytes);
-}
-
-TORRENT_TEST(sanitize_path_dos_reserved_names)
-{
-	// path_sanitize_flags::filter_dos_reserved_names inserts "_" right
-	// after the base name of a reserved device name, keeping the rest
-	// (including any extension) intact, rather than dropping the element.
-	lt::path_sanitize_flags_t const filter = lt::path_sanitize_flags::filter_dos_reserved_names;
-
-	// a reserved name gets "_" appended
-	TEST_EQUAL(sanitize("con", false, filter), "con_");
-	// force_element doesn't matter here, the result is already non-empty
-	TEST_EQUAL(sanitize("con", true, filter), "con_");
-
-	// the extension, and the original casing, are both preserved
-	TEST_EQUAL(sanitize("con.txt", false, filter), "con_.txt");
-	TEST_EQUAL(sanitize("CoM1", false, filter), "CoM1_");
-
-	// windows treats the superscript digits U+00B9/00B2/00B3 as valid
-	// COM#/LPT# digits too (encoded here as UTF-8)
-	TEST_EQUAL(sanitize("com\xc2\xb9.txt", false, filter), "com\xc2\xb9_.txt");
-	TEST_EQUAL(sanitize("lpt\xc2\xb2", false, filter), "lpt\xc2\xb2_");
-
-	// the *first* dot delimits the base name: "nul.tar.gz" is equivalent
-	// to "nul", not "nul.tar", so "_" goes right after "nul"
-	TEST_EQUAL(sanitize("nul.tar.gz", false, filter), "nul_.tar.gz");
-
-	// a name that isn't reserved is untouched
-	TEST_EQUAL(sanitize("console", false, filter), "console");
-
-	// the substituted element is fed back through the normal
-	// sanitization, so e.g. a filtered character in the extension is
-	// still dropped
-	TEST_EQUAL(sanitize("con.a/b", false, filter), "con_.ab");
-
-	// ... and the 240-character limit still applies too. The reserved-name
-	// check runs after truncation (see sanitize_path_dos_reserved_names_
-	// hidden_by_other_rules below for why), so the inserted "_" adds one
-	// byte on top of the 240-byte truncation point.
-	std::string const long_element = "nul." + std::string(240, 'x');
-	std::string const long_expected = "nul_." + std::string(236, 'x');
-	TEST_EQUAL(sanitize(long_element, false, filter), long_expected);
-
-	// with the flag clear, reserved names are left alone
-	TEST_EQUAL(sanitize("con", false, lt::path_sanitize_flags_t{}), "con");
-}
-
-TORRENT_TEST(sanitize_path_dos_reserved_names_hidden_by_other_rules)
-{
-	// path_sanitize_flags::filter_dos_reserved_names must catch a reserved
-	// name that only becomes one *after* other sanitization rules run,
-	// otherwise a name hidden behind a character dropped or trimmed later
-	// would slip past the check unnoticed, only to reappear once the rest
-	// of sanitization strips those characters away.
-	lt::path_sanitize_flags_t const filter = lt::path_sanitize_flags::filter_dos_reserved_names
-		| lt::path_sanitize_flags::filter_unicode_formatting_chars
-		| lt::path_sanitize_flags::trim_trailing_spaces_and_dots;
-
-	// U+200B (zero-width space, encoded here as UTF-8) sits between "co"
-	// and "n"; once filter_unicode_formatting_chars strips it out, the
-	// base name becomes the reserved "con"
-	TEST_EQUAL(sanitize("co\xe2\x80\x8bn.txt", false, filter), "con_.txt");
-
-	// a trailing space, once trim_trailing_spaces_and_dots removes it,
-	// turns "CON " into the reserved "CON"
-	TEST_EQUAL(sanitize("CON ", false, filter), "CON_");
-
-	// sanity check: with filter_dos_reserved_names clear, the other rules
-	// still filter/trim these the same way, but the now-reserved name is
-	// left alone
-	lt::path_sanitize_flags_t const no_dos_filter =
-		lt::path_sanitize_flags::filter_unicode_formatting_chars
-		| lt::path_sanitize_flags::trim_trailing_spaces_and_dots;
-	TEST_EQUAL(sanitize("co\xe2\x80\x8bn.txt", false, no_dos_filter), "con.txt");
-	TEST_EQUAL(sanitize("CON ", false, no_dos_filter), "CON");
-}
-
-TORRENT_TEST(sanitize_path_trailing_dots)
-{
-	TEST_EQUAL(sanitize("a"), "a");
-	TEST_EQUAL(sanitize("c"), "c");
-
-	// path_sanitize_flags::trim_trailing_spaces_and_dots selects whether
-	// trailing dots are stripped. Exercise both rulesets explicitly so the
-	// test doesn't depend on the platform's default.
-	lt::path_sanitize_flags_t const trim = lt::path_sanitize_flags::trim_trailing_spaces_and_dots;
-	TEST_EQUAL(sanitize("abc...", false, trim), "abc");
-	TEST_EQUAL(sanitize("abc.", false, trim), "abc");
-	TEST_EQUAL(sanitize("a. . .", false, trim), "a");
-
-	TEST_EQUAL(sanitize("abc...", false, lt::path_sanitize_flags_t{}), "abc...");
-	TEST_EQUAL(sanitize("abc.", false, lt::path_sanitize_flags_t{}), "abc.");
-	TEST_EQUAL(sanitize("a. . .", false, lt::path_sanitize_flags_t{}), "a. . .");
-}
-
-TORRENT_TEST(sanitize_path_trailing_spaces)
-{
-	TEST_EQUAL(sanitize("a"), "a");
-	TEST_EQUAL(sanitize("c"), "c");
-
-	// see path_sanitize_flags::trim_trailing_spaces_and_dots, tested
-	// explicitly here so this runs the same on every platform.
-	lt::path_sanitize_flags_t const trim = lt::path_sanitize_flags::trim_trailing_spaces_and_dots;
-	TEST_EQUAL(sanitize("abc   ", false, trim), "abc");
-	TEST_EQUAL(sanitize("abc ", false, trim), "abc");
-
-	TEST_EQUAL(sanitize("abc   ", false, lt::path_sanitize_flags_t{}), "abc   ");
-	TEST_EQUAL(sanitize("abc ", false, lt::path_sanitize_flags_t{}), "abc ");
-}
-
-TORRENT_TEST(sanitize_path)
-{
-	TEST_EQUAL(sanitize("\0\0\xed\0\x80"), "_");
-
-	TEST_EQUAL(sanitize("/a/"), "a");
-	TEST_EQUAL(sanitize("b"), "b");
-	TEST_EQUAL(sanitize("c"), "c");
-
-	TEST_EQUAL(sanitize("a...b"), "a...b");
-
-	TEST_EQUAL(sanitize("a"), "a");
-	// ".." sanitizes to nothing (unless force_element is set)
-	TEST_EQUAL(sanitize(".."), "");
-	TEST_EQUAL(sanitize("c"), "c");
-
-	// "/.." sanitizes to nothing: the "/" is filtered out, leaving the same
-	// all-dots case as above. "." (without force_element) is skipped too
-	TEST_EQUAL(sanitize("/.."), "");
-	TEST_EQUAL(sanitize("."), "");
-
-	// see path_sanitize_flags::sanitize_invalid_chars_win /
-	// sanitize_invalid_chars_android for the flag-driven coverage; ":" is
-	// invalid under either, tested explicitly here so this runs the same
-	// on every platform.
-	TEST_EQUAL(
-		sanitize("dev:", false, lt::path_sanitize_flags::sanitize_invalid_chars_win), "dev_");
-	TEST_EQUAL(sanitize("c:", false, lt::path_sanitize_flags::sanitize_invalid_chars_win), "c_");
-	TEST_EQUAL(sanitize("dev:", false, lt::path_sanitize_flags_t{}), "dev:");
-	TEST_EQUAL(sanitize("c:", false, lt::path_sanitize_flags_t{}), "c:");
-
-	// leading backslash is filtered out regardless of platform
-	TEST_EQUAL(sanitize("\\c"), "c");
-
-	TEST_EQUAL(sanitize("\b"), "_");
-
-	TEST_EQUAL(sanitize("filename"), "filename");
-
-	TEST_EQUAL(sanitize("abc"), "abc");
-	// an empty element sanitizes to "_"
-	TEST_EQUAL(sanitize(""), "_");
-
-	// path_sanitize_flags::trim_trailing_spaces_and_dots: trailing spaces
-	// are trimmed; when nothing is left, the result is "_". Tested
-	// explicitly here so this runs the same on every platform.
-	TEST_EQUAL(sanitize("   ", false, lt::path_sanitize_flags::trim_trailing_spaces_and_dots), "_");
-	TEST_EQUAL(sanitize("   ", false, lt::path_sanitize_flags_t{}), "   ");
-
-	// "\b" is always invalid (a C0 control); "?" only under
-	// sanitize_invalid_chars_win / _android
-	TEST_EQUAL(
-		sanitize("\b?filename=4", false, lt::path_sanitize_flags::sanitize_invalid_chars_win),
-		"__filename=4");
-	TEST_EQUAL(sanitize("\b?filename=4", false, lt::path_sanitize_flags_t{}), "_?filename=4");
-
-	TEST_EQUAL(sanitize("filename=4"), "filename=4");
-
-	// valid 2-byte sequence
-	TEST_EQUAL(sanitize("filename\xc2\xa1"), "filename\xc2\xa1");
-
-	// truncated 2-byte sequence
-	TEST_EQUAL(sanitize("filename\xc2"), "filename_");
-
-	// valid 3-byte sequence
-	TEST_EQUAL(sanitize("filename\xe2\x9f\xb9"), "filename\xe2\x9f\xb9");
-
-	// truncated 3-byte sequence
-	TEST_EQUAL(sanitize("filename\xe2\x9f"), "filename_");
-
-	// truncated 3-byte sequence
-	TEST_EQUAL(sanitize("filename\xe2"), "filename_");
-
-	// valid 4-byte sequence
-	TEST_EQUAL(sanitize("filename\xf0\x9f\x92\x88"), "filename\xf0\x9f\x92\x88");
-
-	// truncated 4-byte sequence
-	TEST_EQUAL(sanitize("filename\xf0\x9f\x92"), "filename_");
-
-	// 5-byte utf-8 sequence (not allowed)
-	TEST_EQUAL(sanitize("filename\xf8\x9f\x9f\x9f\x9f"
-						"foobar"),
-		"filename_foobar");
-
-	// redundant (overlong) 2-byte sequence
-	// ascii code 0x2e encoded with a leading 0
-	TEST_EQUAL(sanitize("filename\xc0\xae"), "filename_");
-
-	// redundant (overlong) 3-byte sequence
-	// ascii code 0x2e encoded with two leading 0s
-	TEST_EQUAL(sanitize("filename\xe0\x80\xae"), "filename_");
-
-	// redundant (overlong) 4-byte sequence
-	// ascii code 0x2e encoded with three leading 0s
-	TEST_EQUAL(sanitize("filename\xf0\x80\x80\xae"), "filename_");
-
-	// a filename where every character is filtered is not replaced by an underscore
-	TEST_EQUAL(sanitize("//\\"), "");
-
-	// make sure suspicious unicode characters are filtered out
-	// that's utf-8 for U+200e LEFT-TO-RIGHT MARK
-	TEST_EQUAL(sanitize("foo\xe2\x80\x8e"
-						"bar"),
-		"foobar");
-
-	// make sure suspicious unicode characters are filtered out
-	// that's utf-8 for U+202b RIGHT-TO-LEFT EMBEDDING
-	TEST_EQUAL(sanitize("foo\xe2\x80\xab"
-						"bar"),
-		"foobar");
-}
-
-TORRENT_TEST(sanitize_path_control_chars)
-{
-	// DEL (U+007F) is replaced with '_'
-	TEST_EQUAL(sanitize("foo\x7f"
-						"bar"),
-		"foo_bar");
-
-	// C1 control U+0080 (utf-8: c2 80) is replaced with '_'
-	TEST_EQUAL(sanitize("foo\xc2\x80"
-						"bar"),
-		"foo_bar");
-
-	// C1 control U+009F (utf-8: c2 9f) is replaced with '_'
-	TEST_EQUAL(sanitize("foo\xc2\x9f"
-						"bar"),
-		"foo_bar");
-}
-
-TORRENT_TEST(sanitize_path_format_chars)
-{
-	// zero-width space U+200B (utf-8: e2 80 8b) is silently dropped
-	TEST_EQUAL(sanitize("foo\xe2\x80\x8b"
-						"bar"),
-		"foobar");
-
-	// zero-width non-joiner U+200C (utf-8: e2 80 8c) is dropped
-	TEST_EQUAL(sanitize("foo\xe2\x80\x8c"
-						"bar"),
-		"foobar");
-
-	// zero-width joiner U+200D (utf-8: e2 80 8d) is dropped
-	TEST_EQUAL(sanitize("foo\xe2\x80\x8d"
-						"bar"),
-		"foobar");
-
-	// word joiner U+2060 (utf-8: e2 81 a0) is dropped
-	TEST_EQUAL(sanitize("foo\xe2\x81\xa0"
-						"bar"),
-		"foobar");
-
-	// invisible times U+2062 (utf-8: e2 81 a2) is dropped
-	TEST_EQUAL(sanitize("foo\xe2\x81\xa2"
-						"bar"),
-		"foobar");
-
-	// LRI U+2066 (utf-8: e2 81 a6) is dropped
-	TEST_EQUAL(sanitize("foo\xe2\x81\xa6"
-						"bar"),
-		"foobar");
-
-	// PDI U+2069 (utf-8: e2 81 a9) is dropped
-	TEST_EQUAL(sanitize("foo\xe2\x81\xa9"
-						"bar"),
-		"foobar");
-
-	// Arabic letter mark U+061C (utf-8: d8 9c) is dropped
-	TEST_EQUAL(sanitize("foo\xd8\x9c"
-						"bar"),
-		"foobar");
-
-	// BOM / zero-width no-break space U+FEFF (utf-8: ef bb bf) is dropped
-	TEST_EQUAL(sanitize("foo\xef\xbb\xbf"
-						"bar"),
-		"foobar");
-}
-
-TORRENT_TEST(sanitize_path_force)
-{
-	TEST_EQUAL(sanitize("\0\0\xed\0\x80", true), "_");
-
-	TEST_EQUAL(sanitize("/a/", true), "a");
-	TEST_EQUAL(sanitize("b", true), "b");
-	TEST_EQUAL(sanitize("c", true), "c");
-
-	TEST_EQUAL(sanitize("a...b", true), "a...b");
-
-	TEST_EQUAL(sanitize("a", true), "a");
-	// with force_element, ".." is replaced with "_" instead of being skipped
-	TEST_EQUAL(sanitize("..", true), "_");
-	TEST_EQUAL(sanitize("c", true), "c");
-
-	// "/.." : the "/" is filtered out, leaving the same all-dots case as
-	// above. "." also becomes "_" with force_element set
-	TEST_EQUAL(sanitize("/..", true), "_");
-	TEST_EQUAL(sanitize(".", true), "_");
-
-	// see path_sanitize_flags::sanitize_invalid_chars_win /
-	// sanitize_invalid_chars_android for the flag-driven coverage; ":" is
-	// invalid under either, tested explicitly here so this runs the same
-	// on every platform.
-	TEST_EQUAL(sanitize("dev:", true, lt::path_sanitize_flags::sanitize_invalid_chars_win), "dev_");
-	TEST_EQUAL(sanitize("c:", true, lt::path_sanitize_flags::sanitize_invalid_chars_win), "c_");
-	TEST_EQUAL(sanitize("dev:", true, lt::path_sanitize_flags_t{}), "dev:");
-	TEST_EQUAL(sanitize("c:", true, lt::path_sanitize_flags_t{}), "c:");
-
-	// leading backslash is filtered out regardless of platform
-	TEST_EQUAL(sanitize("\\c", true), "c");
-
-	TEST_EQUAL(sanitize("\b", true), "_");
-
-	TEST_EQUAL(sanitize("filename", true), "filename");
-
-	TEST_EQUAL(sanitize("abc", true), "abc");
-	TEST_EQUAL(sanitize("", true), "_");
-
-	// see path_sanitize_flags::trim_trailing_spaces_and_dots, tested
-	// explicitly here so this runs the same on every platform.
-	TEST_EQUAL(sanitize("   ", true, lt::path_sanitize_flags::trim_trailing_spaces_and_dots), "_");
-	TEST_EQUAL(sanitize("   ", true, lt::path_sanitize_flags_t{}), "   ");
-
-	// "\b" is always invalid (a C0 control); "?" only under
-	// sanitize_invalid_chars_win / _android
-	TEST_EQUAL(sanitize("\b?filename=4", true, lt::path_sanitize_flags::sanitize_invalid_chars_win),
-		"__filename=4");
-	TEST_EQUAL(sanitize("\b?filename=4", true, lt::path_sanitize_flags_t{}), "_?filename=4");
-
-	TEST_EQUAL(sanitize("filename=4", true), "filename=4");
-
-	// valid 2-byte sequence
-	TEST_EQUAL(sanitize("filename\xc2\xa1", true), "filename\xc2\xa1");
-
-	// truncated 2-byte sequence
-	TEST_EQUAL(sanitize("filename\xc2", true), "filename_");
-
-	// valid 3-byte sequence
-	TEST_EQUAL(sanitize("filename\xe2\x9f\xb9", true), "filename\xe2\x9f\xb9");
-
-	// truncated 3-byte sequence
-	TEST_EQUAL(sanitize("filename\xe2\x9f", true), "filename_");
-
-	// truncated 3-byte sequence
-	TEST_EQUAL(sanitize("filename\xe2", true), "filename_");
-
-	// valid 4-byte sequence
-	TEST_EQUAL(sanitize("filename\xf0\x9f\x92\x88", true), "filename\xf0\x9f\x92\x88");
-
-	// truncated 4-byte sequence
-	TEST_EQUAL(sanitize("filename\xf0\x9f\x92", true), "filename_");
-
-	// 5-byte utf-8 sequence (not allowed)
-	TEST_EQUAL(sanitize("filename\xf8\x9f\x9f\x9f\x9f"
-						"foobar",
-				   true),
-		"filename_foobar");
-
-	// redundant (overlong) 2-byte sequence
-	// ascii code 0x2e encoded with a leading 0
-	TEST_EQUAL(sanitize("filename\xc0\xae", true), "filename_");
-
-	// redundant (overlong) 3-byte sequence
-	// ascii code 0x2e encoded with two leading 0s
-	TEST_EQUAL(sanitize("filename\xe0\x80\xae", true), "filename_");
-
-	// redundant (overlong) 4-byte sequence
-	// ascii code 0x2e encoded with three leading 0s
-	TEST_EQUAL(sanitize("filename\xf0\x80\x80\xae", true), "filename_");
-
-	// a filename where every character is filtered is replaced by an underscore
-	// when force_element is set
-	TEST_EQUAL(sanitize("//\\", true), "_");
-
-	// make sure suspicious unicode characters are filtered out
-	// that's utf-8 for U+200e LEFT-TO-RIGHT MARK
-	TEST_EQUAL(sanitize("foo\xe2\x80\x8e"
-						"bar",
-				   true),
-		"foobar");
-
-	// make sure suspicious unicode characters are filtered out
-	// that's utf-8 for U+202b RIGHT-TO-LEFT EMBEDDING
-	TEST_EQUAL(sanitize("foo\xe2\x80\xab"
-						"bar",
-				   true),
-		"foobar");
-}
-
-TORRENT_TEST(sanitize_path_zeroes)
-{
-	TEST_EQUAL(sanitize("\0foo"), "_");
-	TEST_EQUAL(sanitize("\0\0\0\0"), "_");
-}
-
-TORRENT_TEST(sanitize_path_colon)
-{
-	// sanitize_invalid_chars_win and sanitize_invalid_chars_android reject
-	// the same set of printable characters (win additionally lists "\b",
-	// but that's already a C0 control, rejected unconditionally)
-	TEST_EQUAL(
-		sanitize("foo:bar", false, lt::path_sanitize_flags::sanitize_invalid_chars_win), "foo_bar");
-	TEST_EQUAL(sanitize("foo:bar", false, lt::path_sanitize_flags::sanitize_invalid_chars_android),
-		"foo_bar");
-	TEST_EQUAL(sanitize("foo:bar", false, lt::path_sanitize_flags_t{}), "foo:bar");
-}
-
-TORRENT_TEST(sanitize_path_unicode_formatting_chars)
-{
-	// the bidi marks/overrides (U+200E/F, U+202A-E) are always filtered;
-	// path_sanitize_flags::filter_unicode_formatting_chars additionally
-	// filters other zero-width/invisible characters, e.g. U+200B (ZWSP)
-	// here, which some users need to disable
-	lt::path_sanitize_flags_t const filter =
-		lt::path_sanitize_flags::filter_unicode_formatting_chars;
-
-	TEST_EQUAL(sanitize("foo\xe2\x80\x8e"
-						"bar",
-				   false,
-				   lt::path_sanitize_flags_t{}),
-		"foobar");
-
-	TEST_EQUAL(sanitize("foo\xe2\x80\x8b"
-						"bar",
-				   false,
-				   filter),
-		"foobar");
-	TEST_EQUAL(sanitize("foo\xe2\x80\x8b"
-						"bar",
-				   false,
-				   lt::path_sanitize_flags_t{}),
-		"foo\xe2\x80\x8b"
-		"bar");
-}
-
-TORRENT_TEST(sanitize_path_borrow)
-{
-	// an element that needs no sanitization is borrowed: the function
-	// returns true and leaves "path" untouched
-	std::string path;
-	TEST_CHECK(
-		lt::aux::sanitize_path_element(path, "readme.txt", lt::path_sanitize_flags::default_flags));
-	TEST_CHECK(path.empty());
-
-	// an element that needs sanitizing is materialized into "path", and the
-	// function returns false
-	path.clear();
-	TEST_CHECK(
-		!lt::aux::sanitize_path_element(path, "foo\\bar", lt::path_sanitize_flags::default_flags));
-	TEST_EQUAL(path, "foobar");
 }
 
 TORRENT_TEST(sanitize_encoding)
@@ -2140,9 +1626,9 @@ namespace {
 		// this test locks in resolve_duplicate_filenames()'s own tie-break
 		// rules (directory precedence over files, case-fold exemption for
 		// directories, pad-file coincidence handling), so it pins that
-		// whole-tree pass explicitly rather than default_flags' current
+		// full-path pass explicitly rather than default_flags' current
 		// deduplicate_per_directory behavior
-		auto const atp = load_torrent_buffer(tmp, whole_tree_dedup_cfg());
+		auto const atp = load_torrent_buffer(tmp, full_path_dedup_cfg());
 		for (auto const i : t.file_range())
 		{
 			std::string const p = resolved_path(atp, i);
@@ -2208,7 +1694,7 @@ TORRENT_TEST(load_torrent_duplicate_filenames_configurable)
 		// call), not deduplicate_per_directory's counter-resuming
 		// algorithm (part of default_flags), which would resolve the same
 		// input without ever exhausting this limit
-		load_torrent_limits cfg = whole_tree_dedup_cfg();
+		load_torrent_limits cfg = full_path_dedup_cfg();
 		cfg.max_duplicate_filenames = t.max_duplicate_filenames;
 		auto const atp = load_torrent_buffer(buf, ec, cfg);
 		TEST_EQUAL(ec, t.expected);
@@ -2270,7 +1756,7 @@ namespace {
 // sanitize_path_element() in isolation), and checks the resulting
 // file paths and rename count. This locks in a baseline for the
 // path-sanitization and duplicate-filename-resolution rules of the
-// whole-tree resolve_duplicate_filenames() pass specifically (hence
+// full-path resolve_duplicate_filenames() pass specifically (hence
 // pinning deduplicate_per_directory off below, even though it's part of
 // default_flags), so a future change to either ruleset has something
 // concrete to diff against.
@@ -2349,7 +1835,7 @@ void test_raw_path_sanitize_case(raw_path_sanitize_case const& t)
 	auto const buf = make_v1_torrent_raw(t.paths);
 
 	error_code ec;
-	auto const atp = load_torrent_buffer(buf, ec, whole_tree_dedup_cfg());
+	auto const atp = load_torrent_buffer(buf, ec, full_path_dedup_cfg());
 	TEST_CHECK(!ec);
 	TEST_CHECK(atp.ti);
 	if (!atp.ti)
@@ -2381,7 +1867,7 @@ namespace {
 // path_sanitize_flags::deduplicate_per_directory set, resolved via
 // aux::resolve_directory_duplicates() (the function torrent::init()
 // calls) directly against the parsed, undeduped layout, rather than
-// resolve_duplicate_filenames()'s whole-tree pass. Never mutates
+// resolve_duplicate_filenames()'s full-path pass. Never mutates
 // file_storage, so the raw names still show up in atp.ti->layout();
 // only the renamed_files this produces reflects the deduped ones.
 struct dedup_per_directory_case
@@ -2389,23 +1875,26 @@ struct dedup_per_directory_case
 	std::vector<std::vector<std::string>> paths;
 	std::vector<std::string> expected;
 	// non-empty only for cases where the same raw "paths" collide the
-	// same way under the whole-tree resolve_duplicate_filenames() pass
-	// (via whole_tree_dedup_cfg()): a plain run of duplicate filenames,
+	// same way under the full-path resolve_duplicate_filenames() pass
+	// (via full_path_dedup_cfg()): a plain run of duplicate filenames,
 	// with no directory-renaming or dash/dot-suffixed literal names
 	// involved, so the only difference between the two passes' output
-	// is "-N" vs the whole-tree pass's own ".N". Left empty for cases
+	// is "-N" vs the full-path pass's own ".N". Left empty for cases
 	// that exercise deduplicate_per_directory-only behavior (directory
 	// renaming, or a literal name already shaped like one pass's own
 	// suffix), where the two passes don't produce comparable output at
 	// all.
-	std::vector<std::string> whole_tree_expected;
+	std::vector<std::string> full_path_expected;
+	// the same raw "paths" with neither deduplication bit set: no
+	// collision is resolved, so colliding entries keep their paths
+	std::vector<std::string> no_dedup_expected;
 };
 
 std::vector<dedup_per_directory_case> const dedup_per_directory_cases = {
 	// a run of identical names resumes the "-N" counter from the last
 	// one picked, rather than rescanning from 1 each time. Nothing here
 	// is specific to deduplicate_per_directory (no directory renaming,
-	// no literal name already shaped like a suffix), so the whole-tree
+	// no literal name already shaped like a suffix), so the full-path
 	// pass resolves the identical collision the same way, just with its
 	// own ".N" instead
 	{
@@ -2424,6 +1913,11 @@ std::vector<dedup_per_directory_case> const dedup_per_directory_cases = {
 			"root/dir/dup.1.txt",
 			"root/dir/dup.2.txt",
 		},
+		{
+			"root/dir/dup.txt",
+			"root/dir/dup.txt",
+			"root/dir/dup.txt",
+		},
 	},
 	// a real, pre-existing "dup-1.txt" is not clobbered: the second
 	// "dup.txt" duplicate's first attempt collides with it, so it
@@ -2440,6 +1934,11 @@ std::vector<dedup_per_directory_case> const dedup_per_directory_cases = {
 			"root/dir/dup-2.txt",
 		},
 		{},
+		{
+			"root/dir/dup.txt",
+			"root/dir/dup-1.txt",
+			"root/dir/dup.txt",
+		},
 	},
 	// unlike the default algorithm, directories are not exempt from
 	// collision-renaming here: two distinct raw names ('/' and '\\',
@@ -2456,12 +1955,16 @@ std::vector<dedup_per_directory_case> const dedup_per_directory_cases = {
 			"root/_-1/fileB",
 		},
 		{},
+		{
+			"root/_/fileA",
+			"root/_/fileB",
+		},
 	},
 	// matching is case-insensitive here too, same as the default
 	// algorithm, so names differing only in case still collide; the
 	// second one is renamed, keeping its own original case. Again
 	// nothing here is specific to deduplicate_per_directory, so the
-	// whole-tree pass produces the same rename with its own ".N"
+	// full-path pass produces the same rename with its own ".N"
 	{
 		{
 			{"dir", "Foo.txt"},
@@ -2475,10 +1978,14 @@ std::vector<dedup_per_directory_case> const dedup_per_directory_cases = {
 			"root/dir/Foo.txt",
 			"root/dir/foo.1.txt",
 		},
+		{
+			"root/dir/Foo.txt",
+			"root/dir/foo.txt",
+		},
 	},
 	// two directories differing only by case collide here too, unlike
-	// the whole-tree algorithm (see resolve_duplicates' "test/Dir/a" /
-	// "test/dir/b" case, pinned to whole_tree_dedup_cfg()), where they fold
+	// the full-path algorithm (see resolve_duplicates' "test/Dir/a" /
+	// "test/dir/b" case, pinned to full_path_dedup_cfg()), where they fold
 	// together unrenamed
 	{
 		{
@@ -2490,6 +1997,10 @@ std::vector<dedup_per_directory_case> const dedup_per_directory_cases = {
 			"root/dir-1/b",
 		},
 		{},
+		{
+			"root/Dir/a",
+			"root/dir/b",
+		},
 	},
 	// same as above, but the two directory names differ in case at more
 	// than one position, and the files inside ("A", "B") don't collide
@@ -2505,15 +2016,19 @@ std::vector<dedup_per_directory_case> const dedup_per_directory_cases = {
 			"root/DupDir-1/B",
 		},
 		{},
+		{
+			"root/dupdir/A",
+			"root/DupDir/B",
+		},
 	},
 	// a file colliding with a directory is resolved the same way as any
 	// other collision here: whichever was created first (lowest
 	// path_index_t) keeps the name. The bare file "a" is parsed before
 	// "a/b" ever needs a directory named "a", so the file's own leaf
 	// gets the lower index and keeps "a"; the directory is renamed
-	// instead. This differs from the whole-tree algorithm's rule (see
+	// instead. This differs from the full-path algorithm's rule (see
 	// resolve_duplicates' "test/a" / "test/a/b" case, pinned to
-	// whole_tree_dedup_cfg()), which always renames the file regardless
+	// full_path_dedup_cfg()), which always renames the file regardless
 	// of parse order; deduplicate_per_directory doesn't need to match
 	// that, only be deterministic for identical input
 	{
@@ -2526,6 +2041,10 @@ std::vector<dedup_per_directory_case> const dedup_per_directory_cases = {
 			"root/a-1/b",
 		},
 		{},
+		{
+			"root/a",
+			"root/a/b",
+		},
 	},
 };
 
@@ -2564,25 +2083,52 @@ void test_dedup_per_directory_case(dedup_per_directory_case const& t)
 		TEST_EQUAL(p, expected);
 	}
 
-	if (t.whole_tree_expected.empty())
+	// with neither deduplication bit set, nothing is renamed by either pass
+	error_code no_dedup_ec;
+	auto const no_dedup_atp = load_torrent_buffer(buf, no_dedup_ec, no_dedup_cfg());
+	TEST_CHECK(!no_dedup_ec);
+	TEST_CHECK(no_dedup_atp.ti);
+	if (no_dedup_atp.ti)
+	{
+		TEST_CHECK(no_dedup_atp.renamed_files.empty());
+		TEST_CHECK(no_dedup_atp.renamed_path_elements.empty());
+
+		file_storage const& no_dedup_fs = no_dedup_atp.ti->layout();
+		renamed_files no_dedup_renamed;
+		no_dedup_renamed.import_filenames(no_dedup_fs, no_dedup_atp.renamed_files);
+		no_dedup_renamed.import_path_elements(no_dedup_fs, no_dedup_atp.renamed_path_elements);
+		filenames const no_dedup_names(no_dedup_fs, no_dedup_renamed);
+
+		TEST_EQUAL(no_dedup_fs.num_files(), int(t.no_dedup_expected.size()));
+		for (lt::file_index_t const i : no_dedup_fs.file_range())
+		{
+			std::string p = no_dedup_names.file_path(i);
+			convert_path_to_posix(p);
+			std::string const& expected = t.no_dedup_expected[std::size_t(static_cast<int>(i))];
+			std::printf("no-dedup: %s == %s\n", p.c_str(), expected.c_str());
+			TEST_EQUAL(p, expected);
+		}
+	}
+
+	if (t.full_path_expected.empty())
 		return;
 
-	// confirm the whole-tree pass resolves the identical raw input the
+	// confirm the full-path pass resolves the identical raw input the
 	// same way, but with its own ".N" suffix, unaffected by
 	// deduplicate_per_directory's "-N"
-	error_code whole_tree_ec;
-	auto const whole_tree_atp = load_torrent_buffer(buf, whole_tree_ec, whole_tree_dedup_cfg());
-	TEST_CHECK(!whole_tree_ec);
-	TEST_CHECK(whole_tree_atp.ti);
-	if (!whole_tree_atp.ti)
+	error_code full_path_ec;
+	auto const full_path_atp = load_torrent_buffer(buf, full_path_ec, full_path_dedup_cfg());
+	TEST_CHECK(!full_path_ec);
+	TEST_CHECK(full_path_atp.ti);
+	if (!full_path_atp.ti)
 		return;
 
-	TEST_EQUAL(whole_tree_atp.ti->layout().num_files(), int(t.whole_tree_expected.size()));
-	for (lt::file_index_t const i : whole_tree_atp.ti->layout().file_range())
+	TEST_EQUAL(full_path_atp.ti->layout().num_files(), int(t.full_path_expected.size()));
+	for (lt::file_index_t const i : full_path_atp.ti->layout().file_range())
 	{
-		std::string const p = resolved_path(whole_tree_atp, i);
-		std::string const& expected = t.whole_tree_expected[std::size_t(static_cast<int>(i))];
-		std::printf("whole-tree: %s == %s\n", p.c_str(), expected.c_str());
+		std::string const p = resolved_path(full_path_atp, i);
+		std::string const& expected = t.full_path_expected[std::size_t(static_cast<int>(i))];
+		std::printf("full-path: %s == %s\n", p.c_str(), expected.c_str());
 		TEST_EQUAL(p, expected);
 	}
 }
@@ -2995,7 +2541,7 @@ TORRENT_TEST(torrent_info_with_hashes_roundtrip)
 // torrent_info(data, ec, from_span) always parses with
 // path_sanitize_flags::deprecated_default, which predates deduplicate_
 // per_directory, so collision resolution here always goes through the
-// pre-2.2 whole-tree pass (test_sanitizer.cpp's sanitize_limits_
+// pre-2.2 full-path pass (test_sanitizer.cpp's sanitize_limits_
 // combinations exercises deduplicate_per_directory through this same
 // deprecated ctor mechanism explicitly, with the flag set). torrent_
 // info::parse_torrent_file() folds every rename into file_storage in
