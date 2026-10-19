@@ -46,10 +46,13 @@ see LICENSE file.
 #include "libtorrent/load_torrent.hpp"
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <functional> // for bind
 #include <fstream>
 #include <iostream>
+#include <thread>
+#include <tuple> // for std::tie
 
 #ifndef TORRENT_WINDOWS
 #include <sys/stat.h>
@@ -1000,6 +1003,219 @@ TORRENT_TEST_DISK_IO(check_files_oversized)
 
 TORRENT_TEST_DISK_IO(check_files_allocate) { test_check_files_all_threads(zero_prio, disk_io); }
 
+namespace {
+// synchronously drives async_check_files() with no resume data, which is
+// what makes the backend consult has_any_file() to decide whether a
+// full recheck is needed.
+status_t run_check_files(lt::disk_interface& io, lt::io_context& ios, lt::storage_holder const& st)
+{
+	status_t result{};
+	bool done = false;
+	add_torrent_params frd;
+	aux::vector<std::string, file_index_t> links;
+	io.async_check_files(st, &frd, links, [&](status_t const s, storage_error const& e) {
+		result = s;
+		TEST_CHECK(!e);
+		done = true;
+	});
+	io.submit_jobs();
+	ios.restart();
+	run_until(ios, done);
+	return result;
+}
+
+// seeds the part file with `data` for `piece`, through a throwaway
+// disk_interface, while `priorities` keeps that piece's file from ever
+// being created at its real path.
+void seed_partfile_piece(lt::disk_io_constructor_type const disk_constructor,
+	std::shared_ptr<torrent_info const> const& info,
+	aux::vector<download_priority_t, file_index_t> const& priorities,
+	std::string const& test_path,
+	piece_index_t const piece,
+	lt::span<char const> data)
+{
+	aux::session_settings sett;
+	boost::asio::io_context ios;
+	counters cnt;
+	std::unique_ptr<disk_interface> io = disk_constructor(ios, sett, cnt);
+
+	renamed_files rf;
+	storage_params p{info->layout(),
+		rf,
+		test_path,
+		{},
+		storage_mode_sparse,
+		priorities,
+		sha1_hash{},
+		info->v1(),
+		info->v2()};
+	storage_holder st = io->new_torrent(std::move(p), std::shared_ptr<void>());
+
+	run_check_files(*io, ios, st);
+
+	bool done = false;
+	io->async_write(st,
+		lt::peer_request{piece, 0, int(data.size())},
+		data.data(),
+		{},
+		[&done](storage_error const& e) {
+			TEST_CHECK(!e);
+			done = true;
+		});
+	io->submit_jobs();
+	ios.restart();
+	run_until(ios, done);
+
+	st.reset();
+	io->abort(true);
+}
+
+// a dont_download file whose real path exists but is empty (e.g. a
+// truncated placeholder) must still be routed through the part file if
+// that's where its data actually lives, consistently across all three
+// storage backends.
+void test_read_dont_download_empty_placeholder(lt::disk_io_constructor_type const disk_constructor)
+{
+	std::string const test_path = current_path();
+	constexpr int piece_size_check = 16;
+	error_code ec;
+	delete_dirs("temp_storage");
+
+	std::vector<lt::create_file_entry> fs;
+	fs.emplace_back("temp_storage/dontdownload", piece_size_check);
+
+	std::vector<char> const data0 = new_piece(piece_size_check);
+
+	lt::create_torrent t(std::move(fs), piece_size_check, lt::create_torrent::v1_only);
+	t.set_hash(0_piece, sha1_hash::max());
+	TEST_EQUAL(t.num_pieces(), 1);
+
+	create_directory(combine_path(test_path, "temp_storage"), ec);
+	if (ec)
+		std::cout << "create_directory: " << ec.message() << std::endl;
+
+	std::shared_ptr<torrent_info const> info = load_torrent_buffer(bencode(t.generate())).ti;
+
+	aux::vector<download_priority_t, file_index_t> priorities;
+	priorities.resize(std::size_t(info->num_files()), dont_download);
+
+	// populate the part file with the only piece, while the file
+	// doesn't exist at its real path at all.
+	seed_partfile_piece(disk_constructor, info, priorities, test_path, 0_piece, data0);
+
+	// a 0-byte placeholder now sits at the file's real path, as if it
+	// had been preallocated or truncated externally, while its actual
+	// data still lives in the part file written above.
+	ofstream(combine_path(test_path, combine_path("temp_storage", "dontdownload")).c_str());
+
+	aux::session_settings sett;
+	boost::asio::io_context ios;
+	counters cnt;
+	std::unique_ptr<disk_interface> io = disk_constructor(ios, sett, cnt);
+	renamed_files rf;
+	storage_params p{info->layout(),
+		rf,
+		test_path,
+		{},
+		storage_mode_sparse,
+		priorities,
+		sha1_hash{},
+		info->v1(),
+		info->v2()};
+	storage_holder st = io->new_torrent(std::move(p), std::shared_ptr<void>());
+
+	run_check_files(*io, ios, st);
+
+	bool done = false;
+	io->async_read(st,
+		lt::peer_request{0_piece, 0, piece_size_check},
+		[&](lt::disk_buffer_holder h, storage_error const& e) {
+			TEST_CHECK(!e);
+			if (!e)
+			{
+				TEST_CHECK(lt::span<char const>(h.data(), piece_size_check)
+					== lt::span<char const>(data0.data(), piece_size_check));
+			}
+			done = true;
+		});
+	io->submit_jobs();
+	ios.restart();
+	run_until(ios, done);
+
+	st.reset();
+	io->abort(true);
+	delete_dirs("temp_storage");
+}
+
+// a torrent whose only on-disk data lives in the part file must still
+// trigger a full recheck, consistently across all three storage
+// backends.
+void test_has_any_file_partfile_only(lt::disk_io_constructor_type const disk_constructor)
+{
+	std::string const test_path = current_path();
+	constexpr int piece_size_check = 16;
+	error_code ec;
+	delete_dirs("temp_storage");
+
+	std::vector<lt::create_file_entry> fs;
+	fs.emplace_back("temp_storage/dontdownload", piece_size_check);
+
+	std::vector<char> const data0 = new_piece(piece_size_check);
+
+	lt::create_torrent t(std::move(fs), piece_size_check, lt::create_torrent::v1_only);
+	t.set_hash(0_piece, sha1_hash::max());
+	TEST_EQUAL(t.num_pieces(), 1);
+
+	create_directory(combine_path(test_path, "temp_storage"), ec);
+	if (ec)
+		std::cout << "create_directory: " << ec.message() << std::endl;
+
+	std::shared_ptr<torrent_info const> info = load_torrent_buffer(bencode(t.generate())).ti;
+
+	aux::vector<download_priority_t, file_index_t> priorities;
+	priorities.resize(std::size_t(info->num_files()), dont_download);
+
+	// write the file's only piece while its priority is 0, so it's
+	// routed into the part file; the file never exists at its real path.
+	seed_partfile_piece(disk_constructor, info, priorities, test_path, 0_piece, data0);
+
+	TEST_CHECK(!exists(combine_path(combine_path(test_path, "temp_storage"), "dontdownload")));
+
+	// fresh disk_interface, no resume data. the only evidence this
+	// torrent has any data at all is the part file.
+	aux::session_settings sett;
+	boost::asio::io_context ios;
+	counters cnt;
+	std::unique_ptr<disk_interface> io = disk_constructor(ios, sett, cnt);
+	renamed_files rf;
+	storage_params p{info->layout(),
+		rf,
+		test_path,
+		{},
+		storage_mode_sparse,
+		priorities,
+		sha1_hash{},
+		info->v1(),
+		info->v2()};
+	storage_holder st = io->new_torrent(std::move(p), std::shared_ptr<void>());
+
+	status_t const status = run_check_files(*io, ios, st);
+
+	TEST_CHECK(status & lt::disk_status::need_full_check);
+
+	st.reset();
+	io->abort(true);
+	delete_dirs("temp_storage");
+}
+} // anonymous namespace
+
+TORRENT_TEST_DISK_IO(read_dont_download_empty_placeholder)
+{
+	test_read_dont_download_empty_placeholder(disk_io);
+}
+
+TORRENT_TEST_DISK_IO(has_any_file_partfile_only) { test_has_any_file_partfile_only(disk_io); }
+
 #if TORRENT_HAVE_MMAP || TORRENT_HAVE_MAP_VIEW_OF_FILE
 TORRENT_TEST(test_pre_allocate_mmap) { test_pre_allocate<mmap_storage>(); }
 #endif
@@ -1031,6 +1247,62 @@ TORRENT_TEST(rename_pread_disk_io) { test_rename<pread_storage>(current_path());
 TORRENT_TEST_DISK_IO(rename_to_existing) { test_rename_to_existing(current_path(), disk_io); }
 
 TORRENT_TEST(remove_pread_disk_io) { test_remove<pread_storage>(current_path()); }
+
+// tick() runs on a disk thread outside the job fence, so it can race the jobs
+// that create and destroy the part file. Drive both sides from separate
+// threads so thread sanitizer gets to see any unsynchronized access
+template <typename StorageType>
+void test_tick_partfile_race(std::string const& test_path)
+{
+	delete_dirs(combine_path(test_path, "temp_storage"));
+
+	std::vector<char> buf;
+	typename file_pool_type<StorageType>::type fp;
+	aux::session_settings set;
+	auto info = setup_torrent_info(buf);
+
+	// a skipped file that doesn't exist on disk makes the storage use a part file
+	aux::vector<download_priority_t, file_index_t> priorities{lt::dont_download};
+	renamed_files rf;
+	storage_params p{info->layout(),
+		rf,
+		test_path,
+		{},
+		storage_mode_sparse,
+		priorities,
+		sha1_hash{},
+		info->v1(),
+		info->v2()};
+	auto s = make_storage<StorageType>(p, fp);
+	storage_error se;
+	s->initialize(set, se);
+	TEST_CHECK(!se.ec);
+
+	std::atomic<bool> done{false};
+	std::thread ticker([&] {
+		while (!done)
+			s->tick();
+	});
+
+	// set_file_priority() recreates the part file even with unchanged
+	// priorities, so each iteration is one destroy and one create
+	for (int i = 0; i < 200; ++i)
+	{
+		s->delete_files(session::delete_files, se);
+		s->set_file_priority(set, priorities, se);
+		TEST_CHECK(!se.ec);
+	}
+	done = true;
+	ticker.join();
+}
+
+#if TORRENT_HAVE_MMAP || TORRENT_HAVE_MAP_VIEW_OF_FILE
+TORRENT_TEST(tick_partfile_race_mmap) { test_tick_partfile_race<mmap_storage>(current_path()); }
+#endif
+
+#ifndef TORRENT_WINDOWS
+TORRENT_TEST(tick_partfile_race_pread) { test_tick_partfile_race<pread_storage>(current_path()); }
+#endif
 
 #if TORRENT_HAS_SYMLINK
 // builds and loads a torrent for a symlink test. Piece hashes are
@@ -2129,6 +2401,137 @@ TORRENT_TEST(readwrite_zero_size_files)
 
 	TEST_EQUAL(ret, fs.total_size());
 	TEST_CHECK(check_pattern(buf, 0));
+}
+
+TORRENT_TEST(move_storage_rolls_back_after_partfile_error)
+{
+	std::string const source = absolute("partfile_rollback_source");
+	std::string const destination = absolute("partfile_rollback_destination");
+	delete_dirs(source);
+	delete_dirs(destination);
+
+	file_storage fs;
+	std::array<char const*, 2> const names = {{"first", "second"}};
+	error_code ec;
+	create_directories(combine_path(source, "payload"), ec);
+	TEST_CHECK(!ec);
+	for (char const* const name : names)
+	{
+		std::string const path = combine_path("payload", name);
+		fs.add_file_borrow({}, path, 1);
+		std::ofstream(combine_path(source, path).c_str()).put('x');
+	}
+
+	renamed_files const rf;
+	storage_error se;
+	bool partfile_move_attempted = false;
+	status_t status;
+	std::string save_path;
+	std::tie(status, save_path) = aux::move_storage(
+		filenames(fs, rf),
+		source,
+		destination,
+		[&](std::string const&, error_code& error) {
+			partfile_move_attempted = true;
+			error = boost::system::errc::make_error_code(boost::system::errc::permission_denied);
+		},
+		move_flags_t::always_replace_files,
+		se);
+
+	TEST_CHECK(partfile_move_attempted);
+	TEST_CHECK((status & disk_status::fatal_disk_error) != status_t{});
+	TEST_EQUAL(save_path, source);
+	TEST_CHECK(se.operation == operation_t::partfile_move);
+	for (char const* const name : names)
+	{
+		std::string const path = combine_path("payload", name);
+		TEST_CHECK(exists(combine_path(source, path)));
+		TEST_CHECK(!exists(combine_path(destination, path)));
+	}
+}
+
+TORRENT_TEST(move_storage_rollback_preserves_skipped_files)
+{
+	std::string const source = absolute("partfile_rollback_skip_source");
+	std::string const destination = absolute("partfile_rollback_skip_destination");
+	delete_dirs(source);
+	delete_dirs(destination);
+
+	error_code ec;
+	create_directories(combine_path(source, "payload"), ec);
+	TEST_CHECK(!ec);
+	create_directories(combine_path(destination, "payload"), ec);
+	TEST_CHECK(!ec);
+	std::ofstream(combine_path(source, "payload/first").c_str()).put('s');
+	std::ofstream(combine_path(source, "payload/second").c_str()).put('m');
+	std::ofstream(combine_path(destination, "payload/first").c_str()).put('d');
+
+	file_storage fs;
+	fs.add_file_borrow({}, "payload/first", 1);
+	fs.add_file_borrow({}, "payload/second", 1);
+	renamed_files const rf;
+	storage_error se;
+	status_t status;
+	std::string save_path;
+	std::tie(status, save_path) = aux::move_storage(
+		filenames(fs, rf),
+		source,
+		destination,
+		[](std::string const&, error_code& error) {
+			error = boost::system::errc::make_error_code(boost::system::errc::permission_denied);
+		},
+		move_flags_t::dont_replace,
+		se);
+
+	TEST_CHECK((status & disk_status::fatal_disk_error) != status_t{});
+	TEST_EQUAL(save_path, source);
+	TEST_EQUAL(std::ifstream(combine_path(source, "payload/first").c_str()).get(), 's');
+	TEST_EQUAL(std::ifstream(combine_path(destination, "payload/first").c_str()).get(), 'd');
+	TEST_EQUAL(std::ifstream(combine_path(source, "payload/second").c_str()).get(), 'm');
+	TEST_CHECK(!exists(combine_path(destination, "payload/second")));
+}
+
+TORRENT_TEST(move_storage_rollback_preserves_missing_source_files)
+{
+	std::string const source = absolute("partfile_rollback_missing_source");
+	std::string const destination = absolute("partfile_rollback_missing_destination");
+	delete_dirs(source);
+	delete_dirs(destination);
+
+	error_code ec;
+	create_directories(combine_path(source, "payload"), ec);
+	TEST_CHECK(!ec);
+	create_directories(combine_path(destination, "payload"), ec);
+	TEST_CHECK(!ec);
+	// "first" is declared in file_storage below but never created in source;
+	// "destination/payload/first" is a pre-existing, unrelated file that a
+	// rollback must not disturb.
+	std::ofstream(combine_path(source, "payload/second").c_str()).put('m');
+	std::ofstream(combine_path(destination, "payload/first").c_str()).put('d');
+
+	file_storage fs;
+	fs.add_file_borrow({}, "payload/first", 1);
+	fs.add_file_borrow({}, "payload/second", 1);
+	renamed_files const rf;
+	storage_error se;
+	status_t status;
+	std::string save_path;
+	std::tie(status, save_path) = aux::move_storage(
+		filenames(fs, rf),
+		source,
+		destination,
+		[](std::string const&, error_code& error) {
+			error = boost::system::errc::make_error_code(boost::system::errc::permission_denied);
+		},
+		move_flags_t::always_replace_files,
+		se);
+
+	TEST_CHECK((status & disk_status::fatal_disk_error) != status_t{});
+	TEST_EQUAL(save_path, source);
+	TEST_CHECK(!exists(combine_path(source, "payload/first")));
+	TEST_EQUAL(std::ifstream(combine_path(destination, "payload/first").c_str()).get(), 'd');
+	TEST_EQUAL(std::ifstream(combine_path(source, "payload/second").c_str()).get(), 'm');
+	TEST_CHECK(!exists(combine_path(destination, "payload/second")));
 }
 
 template <typename StorageType>

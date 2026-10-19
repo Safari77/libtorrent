@@ -76,25 +76,34 @@ namespace libtorrent {
 		auto t = m_torrent.lock();
 		if (!t) aux::throw_ex<system_error>(errors::invalid_torrent_handle);
 		auto& ses = static_cast<session_impl&>(t->session());
-		dispatch(ses.get_context(), std::bind([t, f, &ses](auto&&... args) mutable
-		{
+		dispatch(ses.get_context(),
+			std::bind(
+				[tor = std::move(t), f, &ses](auto&&... args) mutable {
 #ifndef BOOST_NO_EXCEPTIONS
-			try {
+					try
+					{
 #endif
-				(t.get()->*f)(std::forward<Args>(args)...);
+						(tor.get()->*f)(std::forward<Args>(args)...);
 #ifndef BOOST_NO_EXCEPTIONS
-			} catch (system_error const& e) {
-				ses.alerts().emplace_alert<torrent_error_alert>(torrent_handle(t)
-					, e.code(), e.what());
-			} catch (std::exception const& e) {
-				ses.alerts().emplace_alert<torrent_error_alert>(torrent_handle(t)
-					, error_code(), e.what());
-			} catch (...) {
-				ses.alerts().emplace_alert<torrent_error_alert>(torrent_handle(t)
-					, error_code(), "unknown error");
-			}
+					}
+					catch (system_error const& e)
+					{
+						ses.alerts().emplace_alert<torrent_error_alert>(
+							torrent_handle(tor), e.code(), e.what());
+					}
+					catch (std::exception const& e)
+					{
+						ses.alerts().emplace_alert<torrent_error_alert>(
+							torrent_handle(tor), error_code(), e.what());
+					}
+					catch (...)
+					{
+						ses.alerts().emplace_alert<torrent_error_alert>(
+							torrent_handle(tor), error_code(), "unknown error");
+					}
 #endif
-		}, std::forward<Args>(a)...));
+				},
+				std::forward<Args>(a)...));
 	}
 
 	template<typename Fun, typename... Args>
@@ -108,21 +117,26 @@ namespace libtorrent {
 		bool done = false;
 
 		std::exception_ptr ex;
-		dispatch(ses.get_context(), std::bind([t, f, &done, &ses, &ex](auto&&... args) mutable
-		{
+		dispatch(ses.get_context(),
+			std::bind(
+				[tor = std::move(t), f, &done, &ses, &ex](auto&&... args) mutable {
 #ifndef BOOST_NO_EXCEPTIONS
-			try {
+					try
+					{
 #endif
-				(t.get()->*f)(std::forward<Args>(args)...);
+						(tor.get()->*f)(std::forward<Args>(args)...);
 #ifndef BOOST_NO_EXCEPTIONS
-			} catch (...) {
-				ex = std::current_exception();
-			}
+					}
+					catch (...)
+					{
+						ex = std::current_exception();
+					}
 #endif
-			std::unique_lock<std::mutex> l(ses.mut);
-			done = true;
-			ses.cond.notify_all();
-		}, std::forward<Args>(a)...));
+					std::unique_lock<std::mutex> l(ses.mut);
+					done = true;
+					ses.cond.notify_all();
+				},
+				std::forward<Args>(a)...));
 
 		aux::torrent_wait(done, ses);
 		if (ex) std::rethrow_exception(ex);
@@ -144,21 +158,26 @@ namespace libtorrent {
 		bool done = false;
 
 		std::exception_ptr ex;
-		dispatch(ses.get_context(), std::bind([t, f, &r, &done, &ses, &ex](auto&&... args) mutable
-		{
+		dispatch(ses.get_context(),
+			std::bind(
+				[tor = std::move(t), f, &r, &done, &ses, &ex](auto&&... args) mutable {
 #ifndef BOOST_NO_EXCEPTIONS
-			try {
+					try
+					{
 #endif
-				r = (t.get()->*f)(std::forward<Args>(args)...);
+						r = (tor.get()->*f)(std::forward<Args>(args)...);
 #ifndef BOOST_NO_EXCEPTIONS
-			} catch (...) {
-				ex = std::current_exception();
-			}
+					}
+					catch (...)
+					{
+						ex = std::current_exception();
+					}
 #endif
-			std::unique_lock<std::mutex> l(ses.mut);
-			done = true;
-			ses.cond.notify_all();
-		}, std::forward<Args>(a)...));
+					std::unique_lock<std::mutex> l(ses.mut);
+					done = true;
+					ses.cond.notify_all();
+				},
+				std::forward<Args>(a)...));
 
 		aux::torrent_wait(done, ses);
 
@@ -994,7 +1013,11 @@ namespace libtorrent {
 	}
 
 	bool torrent_handle::in_session() const
-	{ return !sync_call_ret<bool>(false, &aux::torrent::is_aborted); }
+	{
+		// cheaply check if the weak_ptr has expired first
+		auto t = m_torrent.lock();
+		return t && !sync_call_ret<bool>(false, &aux::torrent::is_aborted);
+	}
 
 	static_assert(std::is_nothrow_move_constructible<torrent_handle>::value
 		, "should be nothrow move constructible");
