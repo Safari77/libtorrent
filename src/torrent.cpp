@@ -1914,6 +1914,12 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 			m_torrent_file->v1() && !(m_flags & torrent_flags::disable_v1_hashes),
 			m_torrent_file->v2()};
 
+		// latched here rather than in the constructor so it is read at the
+		// same time the backend reads it for the storage. Once it is part of
+		// storage_params this can move to the constructor
+		set_flag(torrent_internal_flags::disable_hash_checks,
+			settings().get_bool(settings_pack::disable_hash_checks));
+
 		// the storage references m_torrent_file's file_storage, so the disk I/O
 		// keeps the torrent_info alive while it has jobs for the storage. It
 		// must not keep the torrent alive, that has to be destructed on the
@@ -2174,10 +2180,14 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 
 		if (!(m_flags & torrent_flags::no_verify_files))
 		{
-			m_ses.disk_thread().async_check_files(
-				m_storage, m_add_torrent_params ? m_add_torrent_params.get() : nullptr
-				, std::move(links), [self = shared_from_this()](status_t st, storage_error const& error)
-				{ self->on_resume_data_checked(st, error); });
+			m_ses.disk_thread().async_check_files(m_storage,
+				m_add_torrent_params ? m_add_torrent_params.get() : nullptr,
+				std::move(links),
+				[self = shared_from_this()](status_t st,
+					storage_error const& error,
+					typed_bitfield<piece_index_t> checked_pieces) {
+					self->on_resume_data_checked(st, error, std::move(checked_pieces));
+				});
 #ifndef TORRENT_DISABLE_LOGGING
 			debug_log("init, async_check_files");
 #endif
@@ -2185,7 +2195,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		}
 		else
 		{
-			on_resume_data_checked({}, storage_error{});
+			on_resume_data_checked({}, storage_error{}, {});
 		}
 
 		update_want_peers();
@@ -2239,8 +2249,10 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		return m_outgoing_pids.count(pid) > 0;
 	}
 
-	void torrent::on_resume_data_checked(status_t const status
-		, storage_error const& error) try
+	void torrent::on_resume_data_checked(status_t const status,
+		storage_error const& error,
+		typed_bitfield<piece_index_t> checked_pieces)
+	try
 	{
 #if TORRENT_USE_ASSERTS
 		TORRENT_ASSERT(m_flags & torrent_internal_flags::outstanding_check_files);
@@ -2356,12 +2368,10 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 
 		bool should_start_full_check = has_error_status;
 
-		// if we got a partial pieces bitfield, it means we were in the middle of
-		// checking this torrent. pick it up where we left off
-		if (!has_error_status
-			&& m_add_torrent_params
-			&& !m_add_torrent_params->have_pieces.empty()
-			&& m_add_torrent_params->have_pieces.size() < m_torrent_file->num_pieces())
+		// a partial pieces bitfield means we were in the middle of checking
+		// this torrent; pick it up where we left off, rather than discarding
+		// it and starting over
+		if (!has_error_status && (status & disk_status::partial_check) && m_add_torrent_params)
 		{
 			m_checking_piece = m_num_checked_pieces
 				= m_add_torrent_params->have_pieces.end_index();
@@ -2467,6 +2477,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 
 		if (should_start_full_check)
 		{
+			m_checkable_pieces = std::move(checked_pieces);
 			stop_announcing();
 			set_state(torrent_status::checking_files);
 			if (should_check_files()) start_checking();
@@ -2476,6 +2487,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		}
 		else
 		{
+			m_checkable_pieces.clear();
 			files_checked();
 		}
 
@@ -2518,6 +2530,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		// completion handler must not touch the picker state we're about
 		// to discard.
 		++m_picker_generation;
+		m_checkable_pieces.clear();
 
 		// removing the piece picker will clear the user priorities
 		// instead, just clear which pieces we have
@@ -2550,13 +2563,21 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		// filesystem for files again
 		m_ses.disk_thread().async_release_files(m_storage);
 
-		m_ses.disk_thread().async_check_files(m_storage, nullptr
-			, {}, [self = shared_from_this()](status_t st, storage_error const& error)
-			{ self->on_force_recheck(st, error); });
+		m_ses.disk_thread().async_check_files(m_storage,
+			nullptr,
+			{},
+			[self = shared_from_this()](status_t st,
+				storage_error const& error,
+				typed_bitfield<piece_index_t> checked_pieces) {
+				self->on_force_recheck(st, error, std::move(checked_pieces));
+			});
 		m_ses.deferred_submit_jobs();
 	}
 
-	void torrent::on_force_recheck(status_t const status, storage_error const& error) try
+	void torrent::on_force_recheck(status_t const status,
+		storage_error const& error,
+		typed_bitfield<piece_index_t> checked_pieces)
+	try
 	{
 		TORRENT_ASSERT(is_single_thread());
 
@@ -2585,11 +2606,13 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 			|| (status & disk_status::file_exist);
 		if (!has_error_status)
 		{
+			m_checkable_pieces.clear();
 			// if there are no files, just start
 			files_checked();
 		}
 		else
 		{
+			m_checkable_pieces = std::move(checked_pieces);
 			m_progress_ppm = 0;
 			m_checking_piece = piece_index_t(0);
 			m_num_checked_pieces = piece_index_t(0);
@@ -2636,17 +2659,23 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 
 		std::uint8_t const gen = m_picker_generation;
 
+		// set once a hash job is actually dispatched below. If every
+		// remaining piece gets skipped instead (have, or known-absent via
+		// m_checkable_pieces), on_piece_hashed() never runs to detect
+		// completion, so start_checking() has to do it itself.
+		bool dispatched = false;
+
 		for (int i = 0; i < num_outstanding; ++i)
 		{
-			if (has_picker())
+			// skip pieces we already have, and pieces known to not be on
+			// disk at all (see m_checkable_pieces)
+			while (m_checking_piece < m_torrent_file->end_piece()
+				&& ((has_picker() && m_picker->have_piece(m_checking_piece))
+					|| (m_checking_piece < m_checkable_pieces.end_index()
+						&& !m_checkable_pieces.get_bit(m_checking_piece))))
 			{
-				// skip pieces we already have
-				while (m_checking_piece < m_torrent_file->end_piece()
-					&& m_picker->have_piece(m_checking_piece))
-				{
-					++m_checking_piece;
-					++m_num_checked_pieces;
-				}
+				++m_checking_piece;
+				++m_num_checked_pieces;
 			}
 
 			if (m_checking_piece >= m_torrent_file->end_piece()) break;
@@ -2664,6 +2693,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 			// completion handler inline, before this call even returns.
 			piece_index_t const piece = m_checking_piece;
 			++m_checking_piece;
+			dispatched = true;
 
 			span<sha256_hash> v2_span(hashes);
 			m_ses.disk_thread().async_hash(m_storage,
@@ -2681,6 +2711,17 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		debug_log("start_checking, m_checking_piece: %d"
 			, static_cast<int>(m_checking_piece));
 #endif
+		if (!dispatched && m_num_checked_pieces >= m_torrent_file->end_piece())
+		{
+			// every remaining piece was skipped without ever dispatching a
+			// hash job; nothing will call on_piece_hashed() to notice
+			// we're done. Defer it rather than finishing inline: callers
+			// like do_resume() are still unwinding their own state/flag
+			// bookkeeping on this stack, same as a real disk completion
+			// would never re-enter them synchronously.
+			post(m_ses.get_context(),
+				[self = shared_from_this()] { self->wrap(&torrent::finish_checking_files); });
+		}
 	}
 	catch (...) { handle_exception(); }
 
@@ -2764,7 +2805,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		boost::tribool hash_passed[2]
 			= { boost::indeterminate, boost::indeterminate };
 
-		if (!settings().get_bool(settings_pack::disable_hash_checks))
+		if (!(m_flags & torrent_internal_flags::disable_hash_checks))
 		{
 			if (torrent_file().info_hashes().has_v1()
 				&& !(m_flags & torrent_flags::disable_v1_hashes))
@@ -2820,21 +2861,17 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 				m_picker->mark_as_finished(piece_block(piece, i), nullptr);
 		}
 
-		if (m_checking_piece < m_torrent_file->end_piece() && has_picker())
+		// skip pieces we already have, and pieces known to not be on disk
+		// at all (see m_checkable_pieces). If this reaches end_piece(), we
+		// already have outstanding jobs for the remaining pieces; we just
+		// need to wait for them to finish
+		while (m_checking_piece < m_torrent_file->end_piece()
+			&& ((has_picker() && m_picker->have_piece(m_checking_piece))
+				|| (m_checking_piece < m_checkable_pieces.end_index()
+					&& !m_checkable_pieces.get_bit(m_checking_piece))))
 		{
-			// skip pieces we already have
-			while (m_picker->have_piece(m_checking_piece))
-			{
-				++m_checking_piece;
-				++m_num_checked_pieces;
-				if (m_checking_piece >= m_torrent_file->end_piece())
-				{
-					// actually, we already have outstanding jobs for
-					// the remaining pieces. We just need to wait for them
-					// to finish
-					break;
-				}
-			}
+			++m_checking_piece;
+			++m_num_checked_pieces;
 		}
 
 		if (m_num_checked_pieces < m_torrent_file->end_piece())
@@ -2892,6 +2929,24 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 #ifndef TORRENT_DISABLE_LOGGING
 		debug_log("on_piece_hashed, completed");
 #endif
+		finish_checking_files();
+	}
+	catch (...)
+	{
+		handle_exception();
+	}
+
+	void torrent::finish_checking_files()
+	{
+		// the deferred post in start_checking() can land after the torrent
+		// was aborted or removed, or after a force_recheck() (or similar
+		// reset) superseded this checking pass
+		if (m_flags & (torrent_internal_flags::torrent_aborted | torrent_internal_flags::deleted))
+			return;
+		if (m_state != torrent_status::checking_files)
+			return;
+		if (m_num_checked_pieces < m_torrent_file->end_piece())
+			return;
 
 		auto const& pack = settings();
 		auto get_int_setting = [&pack](int const name) {
@@ -2919,7 +2974,6 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		m_checking_piece = piece_index_t(0);
 		m_num_checked_pieces = piece_index_t(0);
 	}
-	catch (...) { handle_exception(); }
 
 #if TORRENT_ABI_VERSION == 1
 	void torrent::use_interface(std::string net_interfaces)
@@ -4559,13 +4613,13 @@ namespace {
 		boost::tribool passed = boost::indeterminate;
 		boost::tribool v2_passed = boost::indeterminate;
 
-		if (settings().get_bool(settings_pack::disable_hash_checks))
-		{
-			passed = v2_passed = true;
-		}
-		else if (error)
+		if (error)
 		{
 			passed = v2_passed = false;
+		}
+		else if (m_flags & torrent_internal_flags::disable_hash_checks)
+		{
+			passed = v2_passed = true;
 		}
 		else
 		{
@@ -12029,14 +12083,9 @@ namespace {
 
 		std::uint8_t const gen = m_picker_generation;
 
-		if (settings().get_bool(settings_pack::disable_hash_checks))
-		{
-			// short-circuit the hash check if it's disabled
-			m_picker->started_hash_job(piece);
-			on_piece_verified(std::move(hashes), piece, sha1_hash(), storage_error{}, gen);
-			return;
-		}
-
+		// with disable_hash_checks the backend returns zero hashes, but the
+		// job is still posted. It is what tells the backend the piece is
+		// complete and can be flushed and evicted
 		span<sha256_hash> v2_span(hashes);
 		// mark the piece as hashing before dispatching: with 0 disk threads
 		// (aio_threads=0, e.g. simulations), async_hash() may invoke its

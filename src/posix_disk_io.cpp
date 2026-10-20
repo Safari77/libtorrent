@@ -90,7 +90,8 @@ namespace {
 			// make sure we can remove this torrent without causing a memory
 			// allocation, by causing the allocation now instead
 			storage_index_t const idx = m_free_slots.new_index(m_torrents.end_index());
-			auto storage = std::make_unique<posix_storage>(params);
+			auto storage = std::make_unique<posix_storage>(
+				params, m_settings.get_bool(settings_pack::disable_hash_checks));
 			if (idx == m_torrents.end_index()) m_torrents.emplace_back(std::move(storage));
 			else m_torrents[idx] = std::move(storage);
 			return {idx, *this};
@@ -173,6 +174,15 @@ namespace {
 			, span<sha256_hash> block_hashes, disk_job_flags_t flags
 			, std::function<void(piece_index_t, sha1_hash const&, storage_error const&)> handler) override
 		{
+			// writes go straight to the file, so there is nothing to flush
+			// before completing the job
+			if (m_torrents[storage]->disable_hash_checks())
+			{
+				post(
+					m_ios, [=, h = std::move(handler)] { h(piece, sha1_hash{}, storage_error{}); });
+				return;
+			}
+
 			auto const start_time = aux::steady_clock::now();
 
 			bool const v1 = bool(flags & disk_interface::v1_hash);
@@ -314,10 +324,11 @@ namespace {
 			post(m_ios, [=, h = std::move(handler)]{ h(error); });
 		}
 
-		void async_check_files(storage_index_t storage
-			, add_torrent_params const* resume_data
-			, aux::vector<std::string, file_index_t> links
-			, std::function<void(status_t, storage_error const&)> handler) override
+		void async_check_files(storage_index_t storage,
+			add_torrent_params const* resume_data,
+			aux::vector<std::string, file_index_t> links,
+			std::function<void(status_t, storage_error const&, typed_bitfield<piece_index_t>)>
+				handler) override
 		{
 			posix_storage* st = m_torrents[storage].get();
 
@@ -327,6 +338,7 @@ namespace {
 			storage_error error;
 			auto const ret_flag = st->initialize(m_settings, error);
 			status_t ret = ret_flag;
+			typed_bitfield<piece_index_t> checked_pieces;
 			if (error)
 			{
 				ret |= disk_status::fatal_disk_error;
@@ -338,22 +350,42 @@ namespace {
 
 				if (!m_settings.get_bool(settings_pack::no_recheck_incomplete_resume))
 				{
+					bool need_check = false;
 					if (!aux::contains_resume_data(*rd))
 					{
 						// if we don't have any resume data, we still may need to trigger a
 						// full re-check, if there are *any* files.
 						storage_error ignore;
-						if (st->has_any_file(ignore))
-							ret |= disk_status::need_full_check;
+						need_check = st->has_any_file(ignore);
 					}
-					else if (!verify_success)
+					else
 					{
-						ret |= disk_status::need_full_check;
+						need_check = !verify_success;
 					}
+
+					if (need_check)
+						ret |= disk_status::need_full_check;
+
+					// a partial have_pieces bitfield means the resume was
+					// interrupted mid-check; torrent resumes the check from
+					// where it left off even though verify_resume_data()
+					// succeeded
+					if (verify_success && !rd->have_pieces.empty()
+						&& rd->have_pieces.size() < st->files().num_pieces())
+						ret |= disk_status::partial_check;
+
+					// only worth the stat pass when we're actually about
+					// to hash-check pieces; resume data we trust in full
+					// needs no hint here
+					if (ret & (disk_status::need_full_check | disk_status::partial_check))
+						checked_pieces = st->check_pieces();
 				}
 			}
 
-			post(m_ios, [error, ret, h = std::move(handler)]{ h(ret, error); });
+			post(m_ios,
+				[error, ret, cp = std::move(checked_pieces), h = std::move(handler)]() mutable {
+					h(ret, error, std::move(cp));
+				});
 		}
 
 		void async_rename_file(storage_index_t const storage

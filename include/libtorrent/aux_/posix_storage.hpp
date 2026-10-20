@@ -15,6 +15,7 @@ see LICENSE file.
 #include "libtorrent/config.hpp"
 #include "libtorrent/aux_/stat_cache.hpp"
 #include "libtorrent/file_storage.hpp"
+#include "libtorrent/bitfield.hpp"
 #include "libtorrent/storage_defs.hpp"
 #include "libtorrent/hex.hpp" // to_hex
 #include "libtorrent/aux_/open_mode.hpp" // for aux::open_mode_t
@@ -30,8 +31,9 @@ namespace aux {
 
 	struct TORRENT_EXTRA_EXPORT posix_storage
 	{
-		explicit posix_storage(storage_params const& p);
+		explicit posix_storage(storage_params const& p, bool disable_hash_checks = false);
 		file_storage const& files() const { return m_files; }
+		bool disable_hash_checks() const { return m_disable_hash_checks; }
 		~posix_storage();
 		posix_storage(posix_storage&&) = delete;
 		posix_storage& operator=(posix_storage&&) = delete;
@@ -53,6 +55,9 @@ namespace aux {
 		bool verify_resume_data(add_torrent_params const& rd
 			, aux::vector<std::string, file_index_t> const& links
 			, storage_error& ec);
+		// a hint of which pieces are known to not be on disk at all; see
+		// disk_interface::async_check_files()
+		typed_bitfield<piece_index_t> check_pieces();
 
 		void release_files();
 
@@ -66,6 +71,9 @@ namespace aux {
 		status_t initialize(settings_interface const&, storage_error& ec);
 
 	private:
+		// latched for the lifetime of the storage, it must agree with the
+		// torrent's view of the setting
+		bool m_disable_hash_checks;
 
 		file_pointer open_file(file_index_t idx, open_mode_t mode, std::int64_t offset
 			, storage_error& ec);

@@ -114,10 +114,11 @@ struct TORRENT_EXTRA_EXPORT mmap_disk_io final
 		, std::function<void()> handler = std::function<void()>()) override;
 	void async_delete_files(storage_index_t storage, remove_flags_t options
 		, std::function<void(storage_error const&)> handler) override;
-	void async_check_files(storage_index_t storage
-		, add_torrent_params const* resume_data
-		, aux::vector<std::string, file_index_t> links
-		, std::function<void(status_t, storage_error const&)> handler) override;
+	void async_check_files(storage_index_t storage,
+		add_torrent_params const* resume_data,
+		aux::vector<std::string, file_index_t> links,
+		std::function<void(status_t, storage_error const&, typed_bitfield<piece_index_t>)> handler)
+		override;
 	void async_rename_file(storage_index_t storage, file_index_t index, std::string name
 		, std::function<void(std::string const&, file_index_t, storage_error const&)> handler) override;
 	void async_stop_torrent(storage_index_t storage
@@ -291,7 +292,8 @@ TORRENT_EXPORT std::unique_ptr<disk_interface> mmap_disk_io_constructor(
 	{
 		TORRENT_ASSERT(params.files.is_valid());
 
-		auto storage = std::make_shared<aux::mmap_storage>(params, m_file_pool);
+		auto storage = std::make_shared<aux::mmap_storage>(
+			params, m_file_pool, m_settings.get_bool(settings_pack::disable_hash_checks));
 		storage->set_owner(owner);
 		storage_index_t const idx = m_torrents.add(std::move(storage));
 		return {idx, *this};
@@ -530,7 +532,8 @@ TORRENT_EXPORT std::unique_ptr<disk_interface> mmap_disk_io_constructor(
 		// doesn't have to re-read the block from disk. v2 pieces don't span
 		// file boundaries, so for hybrid torrents the block may extend past
 		// the v2 piece end into v1 padding; hash only the v2 portion.
-		if (!j->error.ec && ret == a.buffer_size && j->storage->v2())
+		if (!j->error.ec && ret == a.buffer_size && j->storage->v2()
+			&& !j->storage->disable_hash_checks())
 		{
 			int const piece_size2 = j->storage->files().piece_size2(a.piece);
 			if (a.offset < piece_size2)
@@ -809,21 +812,20 @@ TORRENT_EXPORT std::unique_ptr<disk_interface> mmap_disk_io_constructor(
 		add_fence_job(j);
 	}
 
-	void mmap_disk_io::async_check_files(storage_index_t const storage
-		, add_torrent_params const* resume_data
-		, aux::vector<std::string, file_index_t> links
-		, std::function<void(status_t, storage_error const&)> handler)
+	void mmap_disk_io::async_check_files(storage_index_t const storage,
+		add_torrent_params const* resume_data,
+		aux::vector<std::string, file_index_t> links,
+		std::function<void(status_t, storage_error const&, typed_bitfield<piece_index_t>)> handler)
 	{
 		aux::vector<std::string, file_index_t>* links_vector = nullptr;
 		if (!links.empty()) links_vector = new aux::vector<std::string, file_index_t>(std::move(links));
 
-		aux::mmap_disk_job* j = m_job_pool.allocate_job<aux::job::check_fastresume>(
-			{},
+		aux::mmap_disk_job* j = m_job_pool.allocate_job<aux::job::check_fastresume>({},
 			m_torrents[storage]->shared_from_this(),
 			std::move(handler),
 			links_vector,
-			resume_data
-		);
+			resume_data,
+			typed_bitfield<piece_index_t>{});
 
 		add_fence_job(j);
 	}
@@ -901,6 +903,9 @@ TORRENT_EXPORT std::unique_ptr<disk_interface> mmap_disk_io_constructor(
 		// we're not using a cache. This is the simple path
 		// just read straight from the file
 		TORRENT_ASSERT(m_magic == 0x1337);
+
+		if (j->storage->disable_hash_checks())
+			return status_t{};
 
 		bool const v1 = bool(j->flags & disk_interface::v1_hash);
 		bool const v2 = !a.block_hashes.empty();
@@ -1145,17 +1150,33 @@ TORRENT_EXPORT std::unique_ptr<disk_interface> mmap_disk_io_constructor(
 		if (m_settings.get_bool(settings_pack::no_recheck_incomplete_resume))
 			return ret_flag;
 
+		status_t need_check{};
 		if (!aux::contains_resume_data(*rd))
 		{
 			// if we don't have any resume data, we still may need to trigger a
 			// full re-check, if there are *any* files.
 			storage_error ignore;
-			return ((j->storage->has_any_file(ignore))
-				? disk_status::need_full_check | ret_flag
-				: ret_flag);
+			if (j->storage->has_any_file(ignore))
+				need_check = disk_status::need_full_check;
+		}
+		else if (!verify_success)
+		{
+			need_check = disk_status::need_full_check;
 		}
 
-		return (verify_success ? ret_flag : disk_status::need_full_check | ret_flag);
+		// a partial have_pieces bitfield means the resume was interrupted
+		// mid-check; torrent resumes the check from where it left off even
+		// though verify_resume_data() succeeded
+		if (verify_success && !rd->have_pieces.empty()
+			&& rd->have_pieces.size() < j->storage->files().num_pieces())
+			need_check |= disk_status::partial_check;
+
+		// only worth the stat pass when we're actually about to hash-check
+		// pieces; resume data we trust in full needs no hint here
+		if (need_check & (disk_status::need_full_check | disk_status::partial_check))
+			a.checked_pieces = j->storage->check_pieces();
+
+		return need_check | ret_flag;
 	}
 
 	status_t mmap_disk_io::do_job(aux::job::rename_file& a, aux::mmap_disk_job* j)

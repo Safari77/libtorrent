@@ -85,7 +85,8 @@ error_code translate_error(std::error_code const& err, bool const write)
 } // namespace
 
 
-mmap_storage::mmap_storage(storage_params const& params, aux::file_view_pool& pool)
+mmap_storage::mmap_storage(
+	storage_params const& params, aux::file_view_pool& pool, bool const disable_hash_checks)
 	: m_files(params.files)
 	, m_renamed_files(params.renamed_files)
 	, m_filenames(m_files, m_renamed_files)
@@ -97,6 +98,7 @@ mmap_storage::mmap_storage(storage_params const& params, aux::file_view_pool& po
 	, m_allocate_files(params.mode == storage_mode_allocate)
 	, m_v1(params.v1)
 	, m_v2(params.v2)
+	, m_disable_hash_checks(disable_hash_checks)
 {
 	TORRENT_ASSERT(files().num_files() > 0);
 	TORRENT_ASSERT(m_v1 || m_v2);
@@ -459,6 +461,20 @@ mmap_storage::mmap_storage(storage_params const& params, aux::file_view_pool& po
 	{
 		return aux::verify_resume_data(
 			rd, links, m_filenames, m_file_priority, m_stat_cache, m_save_path, ec);
+	}
+
+	typed_bitfield<piece_index_t> mmap_storage::check_pieces()
+	{
+		std::function<bool(piece_index_t)> has_piece;
+		if (m_part_file)
+			has_piece = [this](piece_index_t const p) { return m_part_file->has_piece(p); };
+		return aux::check_pieces(
+			m_filenames,
+			m_file_priority,
+			m_stat_cache,
+			m_save_path,
+			[this](file_index_t const i) { return use_partfile(i); },
+			has_piece);
 	}
 
 	std::pair<status_t, std::string> mmap_storage::move_storage(std::string save_path
